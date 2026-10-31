@@ -71,9 +71,9 @@ export function useGameSync(roomCode: string, initialSessionToken?: string) {
     };
   }, [roomCode, fetchState]);
 
-  // Synchronized Countdown Timer (120 seconds for simultaneous guessing)
+  // Synchronized Countdown Timer (120 seconds per turn in turn-based play)
   useEffect(() => {
-    const startTimeStr = gameState?.room.roundStartTime;
+    const startTimeStr = gameState?.room.turnStartTime || gameState?.room.roundStartTime;
     if (!gameState || gameState.room.status !== "PLAYING" || !startTimeStr) {
       setTimeRemaining(120);
       return;
@@ -91,7 +91,7 @@ export function useGameSync(roomCode: string, initialSessionToken?: string) {
     updateTimer();
     const timerInterval = setInterval(updateTimer, 500);
     return () => clearInterval(timerInterval);
-  }, [gameState]);
+  }, [gameState?.room.turnStartTime, gameState?.room.roundStartTime, gameState?.room.status]);
 
   // Actions
   const toggleReady = async (isReady: boolean) => {

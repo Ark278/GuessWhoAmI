@@ -475,11 +475,14 @@ export class GameService {
     const roundNumber = room.currentRound;
     const now = new Date().toISOString();
 
-    // In simultaneous mode, ALL players start with status "PLAYING"
+    // In turn-based mode, randomly select one player to start the guessing turn
+    const firstTurnPlayer = players[0];
+
     const assignments: RoundAssignment[] = [];
     players.forEach((player, idx) => {
       const identity = shuffled[idx];
       usedIds.add(identity.id);
+      const isFirstTurn = player.id === firstTurnPlayer.id;
 
       assignments.push({
         id: crypto.randomUUID(),
@@ -491,7 +494,7 @@ export class GameService {
         identityCategory: identity.category,
         identityTag: identity.tag,
         identityAliases: identity.aliases,
-        status: "PLAYING",
+        status: isFirstTurn ? "PLAYING" : "WAITING_TURN",
         solvedAt: null,
         completionTimeSeconds: null,
       });
@@ -525,6 +528,8 @@ export class GameService {
         .update({
           status: "PLAYING",
           round_start_time: now,
+          current_turn_player_id: firstTurnPlayer.id,
+          turn_start_time: now,
           updated_at: now,
         })
         .eq("id", room.id);
@@ -536,6 +541,8 @@ export class GameService {
     } else {
       room.status = "PLAYING";
       room.roundStartTime = now;
+      room.currentTurnPlayerId = firstTurnPlayer.id;
+      room.turnStartTime = now;
       room.updatedAt = now;
       memoryDB.assignments.set(`${room.id}_${roundNumber}`, assignments);
       memoryDB.usedIdentityIds.set(room.id, usedIds);
@@ -544,12 +551,47 @@ export class GameService {
     return true;
   }
 
-  // 5. SUBMIT GUESS (CONCURRENT SIMULTANEOUS GUESSES FROM ANY ACTIVE PLAYER)
+  // Helper: Advance to next unattempted player or finish round
+  private static advanceNextTurn(
+    room: Room,
+    assignments: RoundAssignment[],
+    players: Player[]
+  ): string | null {
+    // Find players who are still WAITING_TURN in order of players list
+    const waitingPlayers = players.filter((p) => {
+      const a = assignments.find((asg) => asg.playerId === p.id);
+      return a && a.status === "WAITING_TURN";
+    });
+
+    const now = new Date().toISOString();
+
+    if (waitingPlayers.length > 0) {
+      const nextPlayer = waitingPlayers[0];
+      const nextAssignment = assignments.find((a) => a.playerId === nextPlayer.id);
+      if (nextAssignment) {
+        nextAssignment.status = "PLAYING";
+      }
+      room.status = "PLAYING";
+      room.currentTurnPlayerId = nextPlayer.id;
+      room.turnStartTime = now;
+      room.updatedAt = now;
+      return nextPlayer.id;
+    } else {
+      // Everyone has taken their turn!
+      room.status = "RESULTS";
+      room.currentTurnPlayerId = null;
+      room.turnStartTime = null;
+      room.updatedAt = now;
+      return null;
+    }
+  }
+
+  // 5. SUBMIT GUESS (TURN-BASED: ONLY ACTIVE PLAYER CAN GUESS)
   static async submitGuess(
     code: string,
     sessionToken: string,
     guess: string
-  ): Promise<{ correct: boolean; identityName?: string; completionTime?: number }> {
+  ): Promise<{ correct: boolean; identityName?: string; completionTime?: number; nextPlayerId?: string | null }> {
     const upperCode = code.trim().toUpperCase();
     const cleanGuess = (guess || "").trim();
     if (!cleanGuess) return { correct: false };
@@ -637,6 +679,11 @@ export class GameService {
     const player = players.find((p) => p.sessionToken === sessionToken);
     if (!player) throw new Error("Invalid session token");
 
+    // Strictly enforce backend authorization: Only the active turn player can submit guesses!
+    if (room.currentTurnPlayerId !== player.id) {
+      throw new Error("It is not your turn to guess!");
+    }
+
     const playerAssignment = assignments.find((a) => a.playerId === player.id);
     if (!playerAssignment) throw new Error("No assignment found for player in this round.");
 
@@ -649,18 +696,14 @@ export class GameService {
       };
     }
 
-    // Check individual player timer (120s from roundStartTime)
+    // Check individual player turn timer (120s from turnStartTime)
     const now = new Date();
-    const startTime = room.roundStartTime ? new Date(room.roundStartTime) : now;
+    const startTime = room.turnStartTime ? new Date(room.turnStartTime) : now;
     const elapsedSeconds = Math.max(0, (now.getTime() - startTime.getTime()) / 1000);
 
     if (elapsedSeconds > 120) {
       playerAssignment.status = "TIMED_OUT";
-
-      // Check if all players have now completed their turns
-      const allFinished = assignments.every(
-        (a) => (a.playerId === player.id ? "TIMED_OUT" : a.status) !== "PLAYING"
-      );
+      const nextPlayerId = GameService.advanceNextTurn(room, assignments, players);
 
       if (isSupabaseAdminConfigured()) {
         const admin = getSupabaseAdmin();
@@ -672,24 +715,31 @@ export class GameService {
             .eq("status", "PLAYING");
           if (toErr) logDbError("submitGuess timeout (table: round_assignments update)", toErr);
 
+          if (nextPlayerId) {
+            const { error: nextErr } = await admin
+              .from("round_assignments")
+              .update({ status: "PLAYING" })
+              .eq("room_id", room.id)
+              .eq("round_number", room.currentRound)
+              .eq("player_id", nextPlayerId);
+            if (nextErr) logDbError("submitGuess advance turn (table: round_assignments update)", nextErr);
+          }
+
           // Touch rooms.updated_at to notify all clients via Realtime
           const { error: roomErr } = await admin
             .from("rooms")
             .update({
-              updated_at: now.toISOString(),
-              ...(allFinished ? { status: "RESULTS" } : {}),
+              status: room.status,
+              current_turn_player_id: room.currentTurnPlayerId,
+              turn_start_time: room.turnStartTime,
+              updated_at: room.updatedAt,
             })
             .eq("id", room.id);
           if (roomErr) logDbError("submitGuess timeout room update (table: rooms update)", roomErr);
         }
-      } else {
-        if (allFinished) {
-          room.status = "RESULTS";
-          room.updatedAt = now.toISOString();
-        }
       }
 
-      return { correct: false };
+      return { correct: false, nextPlayerId };
     }
 
     // Validate guess against target identity
@@ -709,10 +759,7 @@ export class GameService {
       playerAssignment.solvedAt = now.toISOString();
       playerAssignment.completionTimeSeconds = completionTime;
 
-      // Check if all players have now completed
-      const allFinished = assignments.every(
-        (a) => (a.playerId === player.id ? "SOLVED" : a.status) !== "PLAYING"
-      );
+      const nextPlayerId = GameService.advanceNextTurn(room, assignments, players);
 
       if (isSupabaseAdminConfigured()) {
         const admin = getSupabaseAdmin();
@@ -728,20 +775,27 @@ export class GameService {
             .eq("status", "PLAYING");
           if (solveErr) logDbError("submitGuess solve (table: round_assignments update)", solveErr);
 
+          if (nextPlayerId) {
+            const { error: nextErr } = await admin
+              .from("round_assignments")
+              .update({ status: "PLAYING" })
+              .eq("room_id", room.id)
+              .eq("round_number", room.currentRound)
+              .eq("player_id", nextPlayerId);
+            if (nextErr) logDbError("submitGuess advance turn (table: round_assignments update)", nextErr);
+          }
+
           // Touch rooms.updated_at to notify all clients via Realtime
           const { error: roomErr } = await admin
             .from("rooms")
             .update({
-              updated_at: now.toISOString(),
-              ...(allFinished ? { status: "RESULTS" } : {}),
+              status: room.status,
+              current_turn_player_id: room.currentTurnPlayerId,
+              turn_start_time: room.turnStartTime,
+              updated_at: room.updatedAt,
             })
             .eq("id", room.id);
-          if (roomErr) logDbError("submitGuess all finished (table: rooms update)", roomErr);
-        }
-      } else {
-        if (allFinished) {
-          room.status = "RESULTS";
-          room.updatedAt = now.toISOString();
+          if (roomErr) logDbError("submitGuess room update (table: rooms update)", roomErr);
         }
       }
 
@@ -749,6 +803,7 @@ export class GameService {
         correct: true,
         identityName: playerAssignment.identityName,
         completionTime,
+        nextPlayerId,
       };
     }
 
@@ -836,40 +891,44 @@ export class GameService {
       assignments = memoryDB.assignments.get(`${room.id}_${room.currentRound}`) || [];
     }
 
-    // Auto timeout check on active simultaneous players (120 seconds)
+    // Auto timeout check on active turn player (120 seconds)
     const now = new Date();
-    if (room.status === "PLAYING" && room.roundStartTime) {
-      const startTime = new Date(room.roundStartTime);
+    if (room.status === "PLAYING" && room.turnStartTime && room.currentTurnPlayerId) {
+      const startTime = new Date(room.turnStartTime);
       const elapsedSeconds = (now.getTime() - startTime.getTime()) / 1000;
-
       if (elapsedSeconds >= 120) {
-        let hasChanges = false;
-        const timedOutAssignmentIds: string[] = [];
+        const activeAssignment = assignments.find((a) => a.playerId === room.currentTurnPlayerId);
+        if (activeAssignment && activeAssignment.status === "PLAYING") {
+          activeAssignment.status = "TIMED_OUT";
 
-        assignments.forEach((a) => {
-          if (a.status === "PLAYING") {
-            a.status = "TIMED_OUT";
-            hasChanges = true;
-            timedOutAssignmentIds.push(a.id);
-          }
-        });
-
-        if (hasChanges) {
-          room.status = "RESULTS";
-          room.updatedAt = now.toISOString();
+          const nextPlayerId = GameService.advanceNextTurn(room, assignments, players);
 
           if (isSupabaseAdminConfigured()) {
             const admin = getSupabaseAdmin();
             if (admin) {
-              if (timedOutAssignmentIds.length > 0) {
+              await admin
+                .from("round_assignments")
+                .update({ status: "TIMED_OUT" })
+                .eq("id", activeAssignment.id)
+                .eq("status", "PLAYING");
+
+              if (nextPlayerId) {
                 await admin
                   .from("round_assignments")
-                  .update({ status: "TIMED_OUT" })
-                  .in("id", timedOutAssignmentIds);
+                  .update({ status: "PLAYING" })
+                  .eq("room_id", room.id)
+                  .eq("round_number", room.currentRound)
+                  .eq("player_id", nextPlayerId);
               }
+
               await admin
                 .from("rooms")
-                .update({ status: "RESULTS", updated_at: now.toISOString() })
+                .update({
+                  status: room.status,
+                  current_turn_player_id: room.currentTurnPlayerId,
+                  turn_start_time: room.turnStartTime,
+                  updated_at: room.updatedAt,
+                })
                 .eq("id", room.id);
             }
           }
@@ -883,12 +942,31 @@ export class GameService {
     const isRoomFinished = room.status === "RESULTS";
     const isSelfSolved = selfAssignment?.status === "SOLVED";
 
+    // Find current active turn player details
+    const activeTurnPlayer = players.find((p) => p.id === room.currentTurnPlayerId) || null;
+    const activeTurnAssignment = assignments.find((a) => a.playerId === room.currentTurnPlayerId) || null;
+
+    const isActiveSelf = activeTurnPlayer?.id === selfPlayer?.id;
+    const showActiveIdentityToSelf = isRoomFinished || (isActiveSelf && isSelfSolved);
+
+    const currentTurnPlayerInfo = activeTurnPlayer
+      ? {
+          id: activeTurnPlayer.id,
+          name: activeTurnPlayer.name,
+          identityName: !isActiveSelf || showActiveIdentityToSelf ? activeTurnAssignment?.identityName || null : null,
+          identityCategory: !isActiveSelf || showActiveIdentityToSelf ? activeTurnAssignment?.identityCategory || null : null,
+          identityTag: !isActiveSelf || showActiveIdentityToSelf ? activeTurnAssignment?.identityTag || null : null,
+          isSelf: isActiveSelf,
+        }
+      : null;
+
     // Strictly enforce identity visibility:
     // A player NEVER receives their own identity until they have SOLVED it or the round ends in RESULTS.
     // Session tokens are NEVER included in public player views.
     const publicPlayers: PlayerPublicView[] = players.map((player) => {
       const assignment = assignments.find((a) => a.playerId === player.id);
       const isSelf = player.id === selfPlayer?.id;
+      const isCurrentTurn = player.id === room.currentTurnPlayerId;
       const shouldReveal = !isSelf || isRoomFinished || (isSelf && isSelfSolved);
 
       return {
@@ -896,8 +974,8 @@ export class GameService {
         name: player.name,
         isReady: player.isReady,
         isHost: player.isHost,
-        isCurrentTurn: assignment?.status === "PLAYING",
-        status: assignment?.status || "PLAYING",
+        isCurrentTurn,
+        status: assignment?.status || "WAITING_TURN",
         solvedAt: assignment?.solvedAt || null,
         completionTimeSeconds: typeof assignment?.completionTimeSeconds === "number" ? assignment.completionTimeSeconds : null,
         identityName: shouldReveal ? assignment?.identityName || null : null,
@@ -914,8 +992,8 @@ export class GameService {
         status: room.status,
         currentRound: room.currentRound,
         roundStartTime: room.roundStartTime,
-        currentTurnPlayerId: null,
-        turnStartTime: null,
+        currentTurnPlayerId: room.currentTurnPlayerId,
+        turnStartTime: room.turnStartTime,
         isHost: selfPlayer?.isHost || false,
       },
       self: {
@@ -923,8 +1001,8 @@ export class GameService {
         name: selfPlayer?.name || "",
         isReady: selfPlayer?.isReady || false,
         isHost: selfPlayer?.isHost || false,
-        isCurrentTurn: selfAssignment?.status === "PLAYING",
-        status: selfAssignment?.status || "PLAYING",
+        isCurrentTurn: selfPlayer?.id === room.currentTurnPlayerId,
+        status: selfAssignment?.status || "WAITING_TURN",
         solvedAt: selfAssignment?.solvedAt || null,
         completionTimeSeconds: typeof selfAssignment?.completionTimeSeconds === "number" ? selfAssignment.completionTimeSeconds : null,
         revealedIdentity:
@@ -936,7 +1014,7 @@ export class GameService {
               }
             : null,
       },
-      currentTurnPlayer: null,
+      currentTurnPlayer: currentTurnPlayerInfo,
       players: publicPlayers,
       serverTime: now.toISOString(),
     };
@@ -1023,11 +1101,13 @@ export class GameService {
     }
 
     const shuffled = shuffle(availableIdentities);
+    const firstTurnPlayer = players[0];
     const assignments: RoundAssignment[] = [];
 
     players.forEach((player, idx) => {
       const identity = shuffled[idx];
       usedIds.add(identity.id);
+      const isFirstTurn = player.id === firstTurnPlayer.id;
 
       assignments.push({
         id: crypto.randomUUID(),
@@ -1039,7 +1119,7 @@ export class GameService {
         identityCategory: identity.category,
         identityTag: identity.tag,
         identityAliases: identity.aliases,
-        status: "PLAYING",
+        status: isFirstTurn ? "PLAYING" : "WAITING_TURN",
         solvedAt: null,
         completionTimeSeconds: null,
       });
@@ -1080,6 +1160,8 @@ export class GameService {
           current_round: nextRoundNumber,
           status: "PLAYING",
           round_start_time: now,
+          current_turn_player_id: firstTurnPlayer.id,
+          turn_start_time: now,
           updated_at: now,
         })
         .eq("id", room.id);
@@ -1092,6 +1174,8 @@ export class GameService {
       room.currentRound = nextRoundNumber;
       room.status = "PLAYING";
       room.roundStartTime = now;
+      room.currentTurnPlayerId = firstTurnPlayer.id;
+      room.turnStartTime = now;
       room.updatedAt = now;
       memoryDB.assignments.set(`${room.id}_${nextRoundNumber}`, assignments);
       memoryDB.usedIdentityIds.set(room.id, usedIds);
