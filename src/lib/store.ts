@@ -13,6 +13,31 @@ export function formatDbError(err: any): string {
   return parts.length > 0 ? parts.join(" | ") : (typeof err === "string" ? err : JSON.stringify(err));
 }
 
+export function classifyDbError(err: any, httpStatus?: number): string {
+  if (httpStatus === 401) {
+    return "INVALID_API_KEY_OR_UNAUTHORIZED (HTTP 401: Authentication failed - check if SUPABASE_SERVICE_ROLE_KEY is a valid service_role secret/JWT)";
+  }
+  if (httpStatus === 403) {
+    return "FORBIDDEN_OR_INSUFFICIENT_PERMISSIONS (HTTP 403: Role lacks EXECUTE permission on create_room_and_host or RLS blocked request)";
+  }
+  if (httpStatus === 404 || err?.code === "PGRST202") {
+    return "RPC_FUNCTION_NOT_FOUND (HTTP 404 / PGRST202: public.create_room_and_host not found in PostgREST schema cache - run NOTIFY pgrst, 'reload schema')";
+  }
+  if (err?.code && (String(err.code).startsWith("23") || String(err.code).startsWith("42") || String(err.code).startsWith("P0001"))) {
+    return `POSTGRESQL_EXECUTION_ERROR (SQLSTATE ${err.code}: Database constraint or procedure logic error)`;
+  }
+  if (err?.code && String(err.code).startsWith("PGRST")) {
+    return `POSTGREST_ERROR (Code: ${err.code})`;
+  }
+  if (err?.name === "FetchError" || err?.message?.includes("fetch failed") || (err as any)?.cause?.code === "ECONNREFUSED") {
+    return "NETWORK_FAILURE (Failed to connect to Supabase URL)";
+  }
+  if (httpStatus && httpStatus >= 500) {
+    return `SUPABASE_SERVER_ERROR (HTTP ${httpStatus})`;
+  }
+  return `POSTGREST_OR_HTTP_ERROR (HTTP ${httpStatus || "unknown"})`;
+}
+
 function logDbError(operation: string, err: any) {
   if (!err) return;
   console.error(`[Database Error] ${operation}:`, {
@@ -97,7 +122,12 @@ export class GameService {
       if (!admin) throw new Error("Database admin client unavailable in production");
 
       // 1. Attempt atomic RPC creation
-      const { data: rpcData, error: rpcErr } = await admin.rpc("create_room_and_host", {
+      const {
+        data: rpcData,
+        error: rpcErr,
+        status: rpcStatus,
+        statusText: rpcStatusText,
+      } = await admin.rpc("create_room_and_host", {
         p_code: code,
         p_room_id: roomId,
         p_host_player_id: playerId,
@@ -111,12 +141,30 @@ export class GameService {
 
       // If in production, NEVER fall back to non-atomic creation
       if (rpcErr) {
+        // Log original raw error object BEFORE formatting it
+        console.error("[RPC create_room_and_host Raw Diagnostic]:", {
+          constructorName: (rpcErr as any)?.constructor?.name ?? typeof rpcErr,
+          name: (rpcErr as any)?.name,
+          message: (rpcErr as any)?.message,
+          keys: rpcErr && typeof rpcErr === "object" ? Object.keys(rpcErr) : [],
+          cause: (rpcErr as any)?.cause,
+          stack: (rpcErr as any)?.stack,
+          httpStatus: rpcStatus,
+          httpStatusText: rpcStatusText,
+          code: (rpcErr as any)?.code,
+          details: (rpcErr as any)?.details,
+          hint: (rpcErr as any)?.hint,
+        });
+
+        const classified = classifyDbError(rpcErr, rpcStatus);
+        console.error(`[Database Error Classification]: ${classified}`);
+
         logDbError("createRoom (rpc create_room_and_host)", rpcErr);
         if (process.env.NODE_ENV === "production") {
           throw new Error(
-            `Database error creating room: Atomic procedure create_room_and_host failed (${formatDbError(
+            `Database error creating room: Atomic procedure create_room_and_host failed [${classified}] (${formatDbError(
               rpcErr
-            )}). Non-atomic fallback is forbidden in production.`
+            )} | HTTP ${rpcStatus} ${rpcStatusText || ""}). Non-atomic fallback is forbidden in production.`
           );
         }
       }
