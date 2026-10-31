@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { GameService } from "@/lib/store";
 
+export const preferredRegion = "bom1";
+
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
