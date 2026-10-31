@@ -1,7 +1,17 @@
 import { Room, Player, RoundAssignment, GameStateResponse, PlayerPublicView } from "./types";
 import { IDENTITIES, Identity } from "./identities";
 import { isCorrectGuess } from "./normalize";
-import { supabaseAdmin, isSupabaseConfigured } from "./supabase";
+import { supabaseAdmin, getSupabaseAdmin, isSupabaseConfigured } from "./supabase";
+
+export function formatDbError(err: any): string {
+  if (!err) return "Unknown database error";
+  const parts: string[] = [];
+  if (err.message && err.message.trim()) parts.push(err.message.trim());
+  if (err.code) parts.push(`Code: ${err.code}`);
+  if (err.details && err.details.trim()) parts.push(`Details: ${err.details.trim()}`);
+  if (err.hint && err.hint.trim()) parts.push(`Hint: ${err.hint.trim()}`);
+  return parts.length > 0 ? parts.join(" | ") : (typeof err === "string" ? err : JSON.stringify(err));
+}
 
 interface MemoryDB {
   rooms: Map<string, Room>; // key: room code
@@ -72,17 +82,28 @@ export class GameService {
       createdAt: now,
     };
 
-    if (isSupabaseConfigured && supabaseAdmin) {
-      const { error: roomErr } = await supabaseAdmin.from("rooms").insert({
+    const admin = getSupabaseAdmin() || supabaseAdmin;
+
+    if (isSupabaseConfigured && admin) {
+      const { error: roomErr } = await admin.from("rooms").insert({
         id: roomId,
         code,
         host_player_id: playerId,
         status: "LOBBY",
         current_round: 1,
       });
-      if (roomErr) throw new Error(`Database error creating room: ${roomErr.message}`);
 
-      const { error: playerErr } = await supabaseAdmin.from("players").insert({
+      if (roomErr) {
+        console.error("[Database Error] createRoom (table: rooms):", {
+          code: roomErr.code,
+          message: roomErr.message,
+          details: roomErr.details,
+          hint: roomErr.hint,
+        });
+        throw new Error(`Database error creating room: ${formatDbError(roomErr)}`);
+      }
+
+      const { error: playerErr } = await admin.from("players").insert({
         id: playerId,
         room_id: roomId,
         name: trimmedName,
@@ -90,7 +111,16 @@ export class GameService {
         is_host: true,
         session_token: sessionToken,
       });
-      if (playerErr) throw new Error(`Database error creating player: ${playerErr.message}`);
+
+      if (playerErr) {
+        console.error("[Database Error] createRoom (table: players):", {
+          code: playerErr.code,
+          message: playerErr.message,
+          details: playerErr.details,
+          hint: playerErr.hint,
+        });
+        throw new Error(`Database error creating player: ${formatDbError(playerErr)}`);
+      }
     } else {
       memoryDB.rooms.set(code, room);
       memoryDB.players.set(roomId, [player]);

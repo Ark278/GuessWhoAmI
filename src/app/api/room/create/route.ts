@@ -3,8 +3,10 @@ import { GameService } from "@/lib/store";
 
 export async function POST(req: Request) {
   try {
-    const { name } = await req.json();
-    if (!name || typeof name !== "string") {
+    const body = await req.json().catch(() => ({}));
+    const name = body?.name;
+
+    if (!name || typeof name !== "string" || !name.trim()) {
       return NextResponse.json({ error: "Display name is required" }, { status: 400 });
     }
 
@@ -19,6 +21,19 @@ export async function POST(req: Request) {
       },
     });
   } catch (err: any) {
-    return NextResponse.json({ error: err.message || "Failed to create room" }, { status: 400 });
+    console.error("[API Error] POST /api/room/create:", err);
+
+    const isDev = process.env.NODE_ENV !== "production";
+    const errorMessage = isDev
+      ? err.message || "Failed to create room"
+      : "Failed to create room. Please verify database setup and try again.";
+
+    return NextResponse.json(
+      {
+        error: errorMessage,
+        ...(isDev && { details: err.message }),
+      },
+      { status: 500 }
+    );
   }
 }
