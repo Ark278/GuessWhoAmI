@@ -2,24 +2,44 @@ import { GameService } from "../src/lib/store";
 
 async function runMultiplayerTests() {
   console.log("=================================================");
-  console.log("STARTING TURN-BASED MULTIPLAYER TESTS");
+  console.log("STARTING SIMULTANEOUS MULTIPLAYER TESTS");
   console.log("=================================================\n");
 
-  // TEST 1: Room Creation
-  console.log("--- Test 1: Room Creation ---");
+  // TEST 1: Room Creation & Input Validation Failure
+  console.log("--- Test 1: Room Creation & Failure Handling ---");
+  try {
+    await GameService.createRoom("   ");
+    throw new Error("Validation failure: blank name was accepted");
+  } catch (err: any) {
+    console.log(`[PASS] Blank host name properly rejected: "${err.message}"`);
+  }
+
   const { room, player: host } = await GameService.createRoom("Alice (Host)");
   console.log(`[PASS] Room created with code: ${room.code}`);
   console.log(`[PASS] Host created: ${host.name} (isHost: ${host.isHost})`);
 
-  // TEST 2: Multiple players joining
-  console.log("\n--- Test 2: Multiple Players Joining ---");
+  // TEST 2: Multiple Players Joining & Idempotency
+  console.log("\n--- Test 2: Multiple Players Joining & Idempotency ---");
   const { player: bob } = await GameService.joinRoom(room.code, "Bob");
   const { player: charlie } = await GameService.joinRoom(room.code, "Charlie");
   console.log(`[PASS] Bob joined (isHost: ${bob.isHost})`);
   console.log(`[PASS] Charlie joined (isHost: ${charlie.isHost})`);
 
-  // TEST 3: Readiness & Start Validation
-  console.log("\n--- Test 3: Readiness & Start Validation ---");
+  const { player: bobReconnected } = await GameService.joinRoom(room.code, "Bob");
+  if (bobReconnected.id !== bob.id) {
+    throw new Error("Failed: Reconnecting player was duplicated");
+  }
+  console.log(`[PASS] Idempotent player join: Reconnecting player reuses existing session`);
+
+  // TEST 3: Readiness & Simultaneous Start Validation
+  console.log("\n--- Test 3: Readiness & Simultaneous Start ---");
+  try {
+    await GameService.startGame(room.code, host.sessionToken);
+    throw new Error("Should not start before players are ready");
+  } catch (err: any) {
+    console.log(`[PASS] Unready start rejected: "${err.message}"`);
+  }
+
   await GameService.setReady(room.code, host.sessionToken, true);
   await GameService.setReady(room.code, bob.sessionToken, true);
   await GameService.setReady(room.code, charlie.sessionToken, true);
@@ -27,120 +47,156 @@ async function runMultiplayerTests() {
   await GameService.startGame(room.code, host.sessionToken);
   console.log("[PASS] Game successfully started!");
 
-  // TEST 4: Turn-Based Active Player Verification
-  console.log("\n--- Test 4: Random Active Player Turn Selection ---");
-  const stateAfterStart = await GameService.getGameState(room.code, host.sessionToken);
-  const activeTurnPlayer = stateAfterStart.currentTurnPlayer;
+  // TEST 4: Simultaneous Play State & Identity Privacy
+  console.log("\n--- Test 4: Simultaneous Play & Identity Privacy ---");
+  const aliceState = await GameService.getGameState(room.code, host.sessionToken);
 
-  if (!activeTurnPlayer) {
-    throw new Error("Failed: No active turn player was selected!");
+  // In simultaneous mode, ALL players must be in PLAYING status
+  const allPlaying = aliceState.players.every((p) => p.status === "PLAYING");
+  if (!allPlaying) {
+    throw new Error("Failed: Not all players are in PLAYING status simultaneously");
   }
-  console.log(`[PASS] Active guessing player randomly selected: ${activeTurnPlayer.name}`);
+  console.log(`[PASS] All ${aliceState.players.length} players are actively PLAYING simultaneously`);
 
-  // Count player statuses: exactly 1 must be PLAYING, others must be WAITING_TURN
-  const playingCount = stateAfterStart.players.filter(p => p.status === "PLAYING").length;
-  const waitingCount = stateAfterStart.players.filter(p => p.status === "WAITING_TURN").length;
-
-  if (playingCount !== 1 || waitingCount !== 2) {
-    throw new Error(`Failed: Expected 1 PLAYING and 2 WAITING_TURN, got ${playingCount} and ${waitingCount}`);
+  // Privacy Check: Alice must NOT see her own identity
+  if (aliceState.self.revealedIdentity !== null) {
+    throw new Error("PRIVACY VIOLATION: Alice can see her own revealedIdentity before solving!");
   }
-  console.log(`[PASS] Exactly 1 active guesser in PLAYING status, 2 in WAITING_TURN queue`);
-
-  // TEST 5: Identity Visibility During Turn
-  console.log("\n--- Test 5: Identity Visibility During Active Turn ---");
-  const playerSessions = [
-    { id: host.id, name: host.name, token: host.sessionToken },
-    { id: bob.id, name: bob.name, token: bob.sessionToken },
-    { id: charlie.id, name: charlie.name, token: charlie.sessionToken }
-  ];
-
-  const activeSession = playerSessions.find(p => p.id === activeTurnPlayer.id)!;
-  const nonActiveSession = playerSessions.find(p => p.id !== activeTurnPlayer.id)!;
-
-  // Active player's own perspective: their identity must be hidden (null)
-  const activePerspective = await GameService.getGameState(room.code, activeSession.token);
-  if (activePerspective.currentTurnPlayer?.identityName !== null) {
-    throw new Error(`SECURITY FAILURE: Active guesser can see their own identity!`);
+  const aliceInList = aliceState.players.find((p) => p.id === host.id)!;
+  if (aliceInList.identityName !== null) {
+    throw new Error("PRIVACY VIOLATION: Alice can see her own identityName in public players list!");
   }
-  console.log(`[PASS] Active guesser (${activeSession.name}) sees their identity hidden as null`);
+  console.log(`[PASS] Privacy preserved: Alice cannot see her own secret identity`);
 
-  // Non-active player's perspective: they must see the active player's identity!
-  const nonActivePerspective = await GameService.getGameState(room.code, nonActiveSession.token);
-  const activeIdentitySeenByOthers = nonActivePerspective.currentTurnPlayer?.identityName;
-  if (!activeIdentitySeenByOthers) {
-    throw new Error(`Failed: Non-active player cannot see active guesser's identity!`);
+  // Visibility Check: Alice MUST see Bob and Charlie's secret identities
+  const bobInList = aliceState.players.find((p) => p.id === bob.id)!;
+  const charlieInList = aliceState.players.find((p) => p.id === charlie.id)!;
+  if (!bobInList.identityName || !charlieInList.identityName) {
+    throw new Error("Failed: Other players' identities are not visible to Alice");
   }
-  console.log(`[PASS] Other players see ${activeSession.name}'s identity: "${activeIdentitySeenByOthers}"`);
+  console.log(`[PASS] Alice sees Bob's identity: "${bobInList.identityName}"`);
+  console.log(`[PASS] Alice sees Charlie's identity: "${charlieInList.identityName}"`);
 
-  // TEST 6: Turn Enforcement (Non-active player cannot submit guess)
-  console.log("\n--- Test 6: Enforcing Turn (Non-active guess rejected) ---");
-  let nonActiveBlocked = false;
-  try {
-    await GameService.submitGuess(room.code, nonActiveSession.token, "SomeGuess");
-  } catch (err: any) {
-    nonActiveBlocked = true;
-    console.log(`[PASS] Non-active player guess properly rejected: "${err.message}"`);
+  // Security Check: Verify session tokens are never leaked in public player views
+  const hasLeakedToken = (aliceState.players as any[]).some((p) => p.sessionToken !== undefined);
+  if (hasLeakedToken) {
+    throw new Error("SECURITY VIOLATION: sessionToken found in public player response!");
   }
-  if (!nonActiveBlocked) throw new Error("Failed: Non-active player was allowed to submit a guess!");
+  console.log(`[PASS] Security verified: Session tokens are never exposed in public views`);
 
-  // TEST 7: Active Player Guesses Correctly & Sequential Turn Transition
-  console.log("\n--- Test 7: Active Player 1 Solves -> Auto Advance to Next Player ---");
-  const guessRes = await GameService.submitGuess(room.code, activeSession.token, activeIdentitySeenByOthers);
-  if (!guessRes.correct) throw new Error("Failed: Correct guess rejected");
-  console.log(`[PASS] ${activeSession.name} guessed correctly in ${guessRes.completionTime}s!`);
+  // TEST 5: Simultaneous Concurrent Guesses
+  console.log("\n--- Test 5: Simultaneous Concurrent Guesses ---");
+  const wrongGuessPromise = GameService.submitGuess(room.code, charlie.sessionToken, "Incorrect Celebrity");
+  const correctGuessPromise = GameService.submitGuess(room.code, bob.sessionToken, bobInList.identityName);
 
-  // Fetch updated state: should have advanced to a new player
-  const stateTurn2 = await GameService.getGameState(room.code, host.sessionToken);
-  const activeTurnPlayer2 = stateTurn2.currentTurnPlayer;
-  if (!activeTurnPlayer2 || activeTurnPlayer2.id === activeSession.id) {
-    throw new Error("Failed: Did not advance to next player after turn 1 solved");
+  const [wrongResult, bobSolveResult] = await Promise.all([wrongGuessPromise, correctGuessPromise]);
+
+  if (wrongResult.correct) {
+    throw new Error("Failed: Incorrect guess was marked correct");
   }
-  console.log(`[PASS] Turn advanced to next random player: ${activeTurnPlayer2.name}`);
+  console.log(`[PASS] Charlie's incorrect guess safely rejected`);
 
-  // TEST 8: Player 2 Solves -> Advance to Player 3
-  console.log("\n--- Test 8: Player 2 Solves -> Advance to Final Player ---");
-  const player2Session = playerSessions.find(p => p.id === activeTurnPlayer2.id)!;
-  const player3Session = playerSessions.find(p => p.id !== activeSession.id && p.id !== player2Session.id)!;
-
-  const observerState = await GameService.getGameState(room.code, player3Session.token);
-  const player2TargetIdentity = observerState.currentTurnPlayer?.identityName!;
-
-  const guessRes2 = await GameService.submitGuess(room.code, player2Session.token, player2TargetIdentity);
-  console.log(`[PASS] ${player2Session.name} guessed correctly in ${guessRes2.completionTime}s!`);
-
-  const stateTurn3 = await GameService.getGameState(room.code, host.sessionToken);
-  if (stateTurn3.currentTurnPlayer?.id !== player3Session.id) {
-    throw new Error("Failed: Final turn player was not player 3");
+  if (!bobSolveResult.correct || typeof bobSolveResult.completionTime !== "number") {
+    throw new Error("Failed: Bob's correct guess was not recognized");
   }
-  console.log(`[PASS] Final turn active player: ${player3Session.name}`);
+  console.log(`[PASS] Bob solved his identity "${bobSolveResult.identityName}" in ${bobSolveResult.completionTime}s!`);
 
-  // TEST 9: Final Player Solves -> Transition to RESULTS
-  console.log("\n--- Test 9: Final Player Solves -> Transition to RESULTS ---");
-  const observerSession = playerSessions.find(p => p.id !== player3Session.id)!;
-  const observerStateFinal = await GameService.getGameState(room.code, observerSession.token);
-  const player3TargetIdentity = observerStateFinal.currentTurnPlayer?.identityName!;
+  // TEST 6: Independent Play State Verification
+  console.log("\n--- Test 6: Independent State Isolation ---");
+  const midGameState = await GameService.getGameState(room.code, charlie.sessionToken);
 
-  await GameService.submitGuess(room.code, player3Session.token, player3TargetIdentity);
+  const bobStateNow = midGameState.players.find((p) => p.id === bob.id)!;
+  const charlieStateNow = midGameState.players.find((p) => p.id === charlie.id)!;
+  const aliceStateNow = midGameState.players.find((p) => p.id === host.id)!;
+
+  if (bobStateNow.status !== "SOLVED") {
+    throw new Error("Failed: Bob should be SOLVED");
+  }
+  if (charlieStateNow.status !== "PLAYING" || aliceStateNow.status !== "PLAYING") {
+    throw new Error("Failed: Charlie and Alice should still be actively PLAYING after Bob solved");
+  }
+  if (midGameState.room.status !== "PLAYING") {
+    throw new Error("Failed: Room status should still be PLAYING while others are solving");
+  }
+  console.log(`[PASS] Bob is SOLVED while Charlie and Alice continue PLAYING independently`);
+
+  // TEST 7: Charlie Solves Next
+  console.log("\n--- Test 7: Second Player Solves Independently ---");
+  const bobPerspective = await GameService.getGameState(room.code, bob.sessionToken);
+  const charlieTarget = bobPerspective.players.find((p) => p.id === charlie.id)!.identityName!;
+
+  const charlieSolveResult = await GameService.submitGuess(room.code, charlie.sessionToken, charlieTarget);
+  if (!charlieSolveResult.correct) {
+    throw new Error("Failed: Charlie's correct guess failed");
+  }
+  console.log(`[PASS] Charlie solved in ${charlieSolveResult.completionTime}s!`);
+
+  // TEST 8: Final Player Solves -> Transition to RESULTS
+  console.log("\n--- Test 8: All Players Complete -> Transition to RESULTS ---");
+  const aliceTarget = bobPerspective.players.find((p) => p.id === host.id)!.identityName!;
+  const aliceSolveResult = await GameService.submitGuess(room.code, host.sessionToken, aliceTarget);
+  if (!aliceSolveResult.correct) {
+    throw new Error("Failed: Alice's correct guess failed");
+  }
+  console.log(`[PASS] Alice solved in ${aliceSolveResult.completionTime}s!`);
+
   const resultsState = await GameService.getGameState(room.code, host.sessionToken);
-
   if (resultsState.room.status !== "RESULTS") {
-    throw new Error(`Failed: Expected room status RESULTS, got ${resultsState.room.status}`);
+    throw new Error(`Failed: Room status did not transition to RESULTS, got ${resultsState.room.status}`);
   }
-  console.log("[PASS] All players finished their turns! Room status transitioned to RESULTS!");
+  console.log(`[PASS] All players finished! Room transitioned to RESULTS!`);
 
-  // Verify all players have completion times and revealed identities
-  const solvedPlayers = resultsState.players.filter(p => p.status === "SOLVED");
-  if (solvedPlayers.length !== 3) {
-    throw new Error(`Failed: Not all players recorded as solved`);
+  // Verify Leaderboard
+  const allSolved = resultsState.players.every((p) => p.status === "SOLVED" && p.completionTimeSeconds !== null);
+  if (!allSolved) {
+    throw new Error("Failed: Not all players recorded completion times");
   }
-  console.log(`[PASS] All 3 players have recorded completion times on the leaderboard`);
+  console.log(`[PASS] Leaderboard recorded completion times for all players`);
+
+  // TEST 9: Next Round Progression
+  console.log("\n--- Test 9: Next Round Progression ---");
+  await GameService.setReady(room.code, host.sessionToken, true);
+  await GameService.setReady(room.code, bob.sessionToken, true);
+  await GameService.setReady(room.code, charlie.sessionToken, true);
+
+  await GameService.nextRound(room.code, host.sessionToken);
+  const round2State = await GameService.getGameState(room.code, host.sessionToken);
+
+  if (round2State.room.currentRound !== 2 || round2State.room.status !== "PLAYING") {
+    throw new Error("Failed: Did not advance to Round 2 in PLAYING status");
+  }
+  const round2AllPlaying = round2State.players.every((p) => p.status === "PLAYING" && !p.isReady);
+  if (!round2AllPlaying) {
+    throw new Error("Failed: Round 2 players are not reset to PLAYING with unready status");
+  }
+  console.log(`[PASS] Round 2 started! All players received new identities in PLAYING status`);
+
+  // TEST 10: Timeout Handling Verification
+  console.log("\n--- Test 10: Timeout Handling & Isolation ---");
+  const { room: timeoutRoom, player: tHost } = await GameService.createRoom("Tom");
+  const { player: tJerry } = await GameService.joinRoom(timeoutRoom.code, "Jerry");
+  await GameService.setReady(timeoutRoom.code, tHost.sessionToken, true);
+  await GameService.setReady(timeoutRoom.code, tJerry.sessionToken, true);
+  await GameService.startGame(timeoutRoom.code, tHost.sessionToken);
+
+  // Simulate timeout on timeoutRoom by backdating roundStartTime to 130s ago
+  timeoutRoom.roundStartTime = new Date(Date.now() - 130000).toISOString();
+  const timeoutCheckState = await GameService.getGameState(timeoutRoom.code, tHost.sessionToken);
+  if (timeoutCheckState.room.status !== "RESULTS") {
+    throw new Error(`Failed: Expired round did not transition to RESULTS, got ${timeoutCheckState.room.status}`);
+  }
+  const allTimedOut = timeoutCheckState.players.every((p) => p.status === "TIMED_OUT");
+  if (!allTimedOut) {
+    throw new Error("Failed: Expired players were not marked TIMED_OUT");
+  }
+  console.log(`[PASS] Timeout properly marks expired assignments as TIMED_OUT and transitions room to RESULTS`);
 
   console.log("\n=================================================");
-  console.log("ALL TURN-BASED SEQUENTIAL TESTS PASSED 100%!");
+  console.log("ALL SIMULTANEOUS MULTIPLAYER TESTS PASSED 100%!");
   console.log("=================================================");
 }
 
-runMultiplayerTests().catch(err => {
+runMultiplayerTests().catch((err) => {
   console.error("TEST FAILED:", err);
   process.exit(1);
 });

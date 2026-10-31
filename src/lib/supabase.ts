@@ -4,48 +4,29 @@ function getEnv(key: string): string {
   return (process.env[key] || "").trim();
 }
 
-export function getSupabaseConfig() {
-  const url = getEnv("NEXT_PUBLIC_SUPABASE_URL") || getEnv("SUPABASE_URL");
-  const anonKey =
-    getEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY") ||
-    getEnv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY") ||
-    getEnv("SUPABASE_ANON_KEY");
-  const serviceKey =
-    getEnv("SUPABASE_SERVICE_ROLE_KEY") ||
-    getEnv("SUPABASE_SECRET_KEY") ||
-    getEnv("SB_SECRET");
+const url = getEnv("NEXT_PUBLIC_SUPABASE_URL");
+const anonKey =
+  getEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY") ||
+  getEnv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY");
 
-  const isConfigured = Boolean(url && url.startsWith("https://") && (anonKey || serviceKey));
-  const hasServiceRole = Boolean(serviceKey);
+export const isSupabaseConfigured = Boolean(
+  url && anonKey && url.startsWith("https://")
+);
 
-  return { url, anonKey, serviceKey, isConfigured, hasServiceRole };
-}
+let cachedPublicClient: SupabaseClient | null = null;
 
-export const isSupabaseConfigured = getSupabaseConfig().isConfigured;
-
-// Public client for browser / Realtime subscriptions
+/**
+ * Public client for browser usage and Realtime subscriptions.
+ * Uses only NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY.
+ */
 export function getSupabaseClient(): SupabaseClient | null {
-  const { url, anonKey, isConfigured } = getSupabaseConfig();
-  if (!isConfigured || !anonKey) return null;
-  return createClient(url, anonKey);
-}
+  if (!isSupabaseConfigured) return null;
 
-// Server-side admin client for authoritative database operations
-export function getSupabaseAdmin(): SupabaseClient | null {
-  const { url, anonKey, serviceKey, isConfigured, hasServiceRole } = getSupabaseConfig();
-  if (!isConfigured) return null;
-
-  const keyToUse = serviceKey || anonKey;
-  if (!hasServiceRole && process.env.NODE_ENV === "production") {
-    console.warn(
-      "[Supabase Config Warning] SUPABASE_SERVICE_ROLE_KEY is not set. Backend operations are falling back to anon key and may fail RLS policies."
-    );
+  if (!cachedPublicClient) {
+    cachedPublicClient = createClient(url, anonKey);
   }
 
-  return createClient(url, keyToUse, {
-    auth: { persistSession: false },
-  });
+  return cachedPublicClient;
 }
 
 export const supabase = getSupabaseClient();
-export const supabaseAdmin = getSupabaseAdmin();

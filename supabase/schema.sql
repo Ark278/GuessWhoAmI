@@ -11,8 +11,6 @@ CREATE TABLE IF NOT EXISTS rooms (
   status VARCHAR(20) NOT NULL DEFAULT 'LOBBY' CHECK (status IN ('LOBBY', 'PLAYING', 'RESULTS')),
   current_round INT NOT NULL DEFAULT 1,
   round_start_time TIMESTAMPTZ,
-  current_turn_player_id UUID,
-  turn_start_time TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -46,7 +44,7 @@ CREATE TABLE IF NOT EXISTS round_assignments (
   identity_category VARCHAR(50) NOT NULL,
   identity_tag VARCHAR(100) NOT NULL,
   identity_aliases TEXT[] DEFAULT '{}',
-  status VARCHAR(20) NOT NULL DEFAULT 'WAITING_TURN' CHECK (status IN ('WAITING_TURN', 'PLAYING', 'SOLVED', 'TIMED_OUT')),
+  status VARCHAR(20) NOT NULL DEFAULT 'PLAYING' CHECK (status IN ('PLAYING', 'SOLVED', 'TIMED_OUT')),
   solved_at TIMESTAMPTZ,
   completion_time_seconds NUMERIC(6, 2),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -61,15 +59,71 @@ ALTER TABLE rooms ENABLE ROW LEVEL SECURITY;
 ALTER TABLE players ENABLE ROW LEVEL SECURITY;
 ALTER TABLE round_assignments ENABLE ROW LEVEL SECURITY;
 
+-- Rooms can be read by code for client-side state listeners
+DROP POLICY IF EXISTS "Public read rooms" ON rooms;
 CREATE POLICY "Public read rooms" ON rooms FOR SELECT USING (true);
-CREATE POLICY "Public read players" ON players FOR SELECT USING (true);
-CREATE POLICY "Public read round_assignments" ON round_assignments FOR SELECT USING (true);
 
-CREATE POLICY "Service role full access rooms" ON rooms USING (auth.role() = 'service_role');
-CREATE POLICY "Service role full access players" ON players USING (auth.role() = 'service_role');
-CREATE POLICY "Service role full access round_assignments" ON round_assignments USING (auth.role() = 'service_role');
+-- Never expose players (session tokens) or round_assignments (secret identities) publicly.
+-- All gameplay and identity visibility is securely arbitrated server-side.
+DROP POLICY IF EXISTS "Public read players" ON players;
+DROP POLICY IF EXISTS "Public read round_assignments" ON round_assignments;
 
--- 5. ENABLE SUPABASE REALTIME PUBLICATION
+DROP POLICY IF EXISTS "Service role full access rooms" ON rooms;
+CREATE POLICY "Service role full access rooms" ON rooms 
+  USING (auth.role() = 'service_role')
+  WITH CHECK (auth.role() = 'service_role');
+
+DROP POLICY IF EXISTS "Service role full access players" ON players;
+CREATE POLICY "Service role full access players" ON players 
+  USING (auth.role() = 'service_role')
+  WITH CHECK (auth.role() = 'service_role');
+
+DROP POLICY IF EXISTS "Service role full access round_assignments" ON round_assignments;
+CREATE POLICY "Service role full access round_assignments" ON round_assignments 
+  USING (auth.role() = 'service_role')
+  WITH CHECK (auth.role() = 'service_role');
+
+-- 5. ATOMIC ROOM AND HOST CREATION FUNCTION
+CREATE OR REPLACE FUNCTION create_room_and_host(
+  p_code VARCHAR(6),
+  p_room_id UUID,
+  p_host_player_id UUID,
+  p_host_name VARCHAR(50),
+  p_session_token UUID
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_now TIMESTAMPTZ := now();
+  v_room rooms%ROWTYPE;
+  v_player players%ROWTYPE;
+BEGIN
+  INSERT INTO rooms (id, code, host_player_id, status, current_round, created_at, updated_at)
+  VALUES (p_room_id, p_code, p_host_player_id, 'LOBBY', 1, v_now, v_now)
+  RETURNING * INTO v_room;
+
+  INSERT INTO players (id, room_id, name, is_ready, is_host, session_token, created_at, last_seen_at)
+  VALUES (p_host_player_id, p_room_id, p_host_name, false, true, p_session_token, v_now, v_now)
+  RETURNING * INTO v_player;
+
+  RETURN jsonb_build_object(
+    'room', to_jsonb(v_room),
+    'player', to_jsonb(v_player)
+  );
+END;
+$$;
+
+-- Hardening: Revoke execution from PUBLIC, anon, and authenticated roles.
+-- Only the server (service_role) is authorized to execute this RPC.
+REVOKE ALL ON FUNCTION create_room_and_host(VARCHAR(6), UUID, UUID, VARCHAR(50), UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION create_room_and_host(VARCHAR(6), UUID, UUID, VARCHAR(50), UUID) FROM anon;
+REVOKE ALL ON FUNCTION create_room_and_host(VARCHAR(6), UUID, UUID, VARCHAR(50), UUID) FROM authenticated;
+GRANT EXECUTE ON FUNCTION create_room_and_host(VARCHAR(6), UUID, UUID, VARCHAR(50), UUID) TO service_role;
+
+-- 6. ENABLE SUPABASE REALTIME PUBLICATION
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -77,19 +131,5 @@ BEGIN
     WHERE pubname = 'supabase_realtime' AND tablename = 'rooms'
   ) THEN
     ALTER PUBLICATION supabase_realtime ADD TABLE rooms;
-  END IF;
-
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_publication_tables 
-    WHERE pubname = 'supabase_realtime' AND tablename = 'players'
-  ) THEN
-    ALTER PUBLICATION supabase_realtime ADD TABLE players;
-  END IF;
-
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_publication_tables 
-    WHERE pubname = 'supabase_realtime' AND tablename = 'round_assignments'
-  ) THEN
-    ALTER PUBLICATION supabase_realtime ADD TABLE round_assignments;
   END IF;
 END $$;

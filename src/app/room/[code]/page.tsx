@@ -284,14 +284,15 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
   }
 
   // =========================================================================
-  // SCREEN 2: ACTIVE GAMEPLAY (TURN-BASED SPOTLIGHT STAGE)
+  // SCREEN 2: ACTIVE GAMEPLAY (SIMULTANEOUS GUESSING)
   // =========================================================================
   if (room.status === "PLAYING") {
     const isTimerCritical = timeRemaining <= 10;
     const isTimerWarning = timeRemaining <= 30 && !isTimerCritical;
-    const isMyTurn = Boolean(self.isCurrentTurn);
-    const activeGuesser = currentTurnPlayer;
-    const completedCount = players.filter((p) => p.status === "SOLVED" || p.status === "TIMED_OUT").length;
+    const isSolved = self.status === "SOLVED";
+    const isTimedOut = self.status === "TIMED_OUT";
+    const otherPlayers = players.filter((p) => p.id !== self.id);
+    const solvedCount = players.filter((p) => p.status === "SOLVED").length;
 
     return (
       <main className="min-h-screen bg-[#090b10] text-slate-100 p-4 sm:p-6 lg:p-8 flex flex-col justify-between max-w-5xl mx-auto">
@@ -299,7 +300,7 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
         <header className="flex items-center justify-between pb-4 border-b border-slate-800">
           <div>
             <span className="text-xs font-semibold text-amber-400 uppercase tracking-widest">
-              Round {room.currentRound} &bull; Turn-Based Play
+              Round {room.currentRound} &bull; Simultaneous Guessing
             </span>
             <h1 className="text-lg sm:text-xl font-bold text-white flex items-center gap-2">
               <span>Who Am I?</span>
@@ -309,7 +310,7 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
             </h1>
           </div>
 
-          {/* Individual Turn Countdown Timer */}
+          {/* 120s Countdown Timer */}
           <div className="flex flex-col items-center">
             <div
               className={`flex items-center gap-2 px-5 py-2 rounded-2xl font-mono text-2xl sm:text-3xl font-extrabold border shadow-lg transition-all ${
@@ -324,210 +325,177 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
               <span>{formattedTime}</span>
             </div>
             <span className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mt-1">
-              Active Turn Time
+              Time Remaining
             </span>
           </div>
 
           <div className="text-right">
-            <span className="text-xs text-slate-400">Turns Completed</span>
+            <span className="text-xs text-slate-400">Solved Status</span>
             <div className="text-sm sm:text-base font-bold text-emerald-400">
-              {completedCount} / {players.length} Done
+              {solvedCount} / {players.length} Solved
             </div>
           </div>
         </header>
 
-        {/* CENTER SPOTLIGHT STAGE (THE ACTIVE GUESSER'S ENLARGED FOCUSED CARD) */}
+        {/* TOP SECTION: YOUR FOREHEAD CARD & GUESS SUBMISSION */}
         <section className="my-6">
-          <div className="text-center mb-4">
-            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-400/10 border border-amber-400/20 text-amber-300 text-xs font-semibold">
-              <Target className="w-4 h-4 text-amber-400" />
-              <span>Spotlight Stage &bull; One Player at a Time</span>
-            </div>
-          </div>
-
-          {/* BIG FOCUSED CARD */}
-          <div className="max-w-2xl mx-auto bg-gradient-to-b from-slate-900 to-slate-950 border-2 border-amber-400/40 rounded-3xl p-6 sm:p-10 shadow-2xl shadow-amber-500/10 relative overflow-hidden">
-            {/* Background subtle radial glow */}
+          <div className="max-w-2xl mx-auto bg-gradient-to-b from-slate-900 to-slate-950 border-2 border-amber-400/40 rounded-3xl p-6 sm:p-8 shadow-2xl shadow-amber-500/10 relative overflow-hidden">
             <div className="absolute top-0 left-1/2 -translate-x-1/2 w-80 h-80 bg-amber-400/10 rounded-full blur-3xl pointer-events-none" />
 
             <div className="relative z-10 flex flex-col items-center text-center">
-              {/* Turn Banner */}
-              <div className="mb-4">
-                {isMyTurn ? (
-                  <span className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full bg-amber-400 text-slate-950 text-xs font-black uppercase tracking-wider shadow-md">
-                    <Sparkles className="w-4 h-4" />
-                    IT&rsquo;S YOUR TURN TO GUESS!
+              <span className="text-xs font-black uppercase tracking-widest text-amber-400 mb-2">
+                Your Secret Identity Card
+              </span>
+
+              {isSolved ? (
+                <div className="w-full p-6 rounded-2xl bg-emerald-950/80 border border-emerald-500/50 text-center shadow-lg">
+                  <span className="text-xs uppercase font-bold text-emerald-400 block mb-1">
+                    🎉 You Guessed It!
                   </span>
-                ) : (
-                  <span className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full bg-indigo-500/20 border border-indigo-400/30 text-indigo-300 text-xs font-bold uppercase tracking-wider">
-                    <Volume2 className="w-4 h-4 text-indigo-400 animate-pulse" />
-                    {activeGuesser?.name}&rsquo;s Turn &bull; Answer their questions!
+                  <h3 className="text-2xl sm:text-4xl font-black text-white">
+                    {self.revealedIdentity?.name}
+                  </h3>
+                  <p className="text-xs text-emerald-300 mt-1">
+                    {self.revealedIdentity?.tag} &bull; Solved in {self.completionTimeSeconds}s!
+                  </p>
+                  <p className="text-xs text-slate-400 mt-3 border-t border-emerald-500/20 pt-2">
+                    Help your friends by answering their questions aloud until the round ends!
+                  </p>
+                </div>
+              ) : isTimedOut ? (
+                <div className="w-full p-6 rounded-2xl bg-rose-950/80 border border-rose-500/50 text-center shadow-lg">
+                  <span className="text-xs uppercase font-bold text-rose-400 block mb-1">
+                    ⏰ Time&rsquo;s Up
                   </span>
-                )}
-              </div>
-
-              {/* Large Avatar */}
-              <div
-                className={`w-24 h-24 sm:w-28 sm:h-28 rounded-3xl bg-gradient-to-tr ${getAvatarColor(
-                  activeGuesser?.name || "Player"
-                )} flex items-center justify-center text-white font-extrabold text-3xl sm:text-4xl shadow-xl border-4 border-slate-800 mb-4`}
-              >
-                {getInitials(activeGuesser?.name || "Player")}
-              </div>
-
-              <h2 className="text-2xl sm:text-3xl font-black text-white mb-1">
-                {activeGuesser?.name}
-              </h2>
-
-              {/* Identity Display or Hidden Sticky Note */}
-              {isMyTurn ? (
-                // Current user is guessing -> STICKY NOTE (IDENTITY HIDDEN)
-                <div className="w-full mt-4 max-w-lg">
-                  {self.status === "SOLVED" ? (
-                    <div className="p-5 rounded-2xl bg-emerald-950/80 border border-emerald-500/50 text-center shadow-lg">
-                      <span className="text-xs uppercase font-bold text-emerald-400 block mb-1">
-                        🎉 Identity Guessed!
-                      </span>
-                      <h3 className="text-2xl sm:text-3xl font-extrabold text-white">
-                        {self.revealedIdentity?.name}
-                      </h3>
-                      <p className="text-xs text-emerald-300 mt-1">
-                        {self.revealedIdentity?.tag} &bull; Solved in {self.completionTimeSeconds}s!
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="p-5 sm:p-6 rounded-2xl bg-amber-400 text-slate-950 font-bold sticky-note text-center">
-                      <span className="text-3xl sm:text-4xl font-black font-mono block mb-1">
-                        ? ? ?
-                      </span>
-                      <span className="text-sm sm:text-base font-extrabold block">
-                        Your identity is hidden on your forehead!
-                      </span>
-                      <p className="text-xs text-amber-950 font-semibold mt-1">
-                        Ask questions aloud to everyone: &ldquo;Am I an actor? Am I alive?&rdquo;
-                      </p>
-                    </div>
-                  )}
-
-                  {/* Guess Input for the active player */}
-                  {self.status !== "SOLVED" && (
-                    <form onSubmit={handleGuessSubmit} className="mt-5 space-y-2">
-                      <div className="flex gap-2">
-                        <input
-                          type="text"
-                          value={guessInput}
-                          onChange={(e) => setGuessInput(e.target.value)}
-                          placeholder="Type your guess (e.g. Taylor Swift)..."
-                          className={`flex-1 bg-slate-950 border rounded-2xl px-4 py-3.5 text-white placeholder-slate-500 focus:outline-none text-base transition-all ${
-                            isWrongGuess
-                              ? "border-rose-500 focus:ring-2 focus:ring-rose-500/20 animate-shake"
-                              : "border-slate-700 focus:border-amber-400 focus:ring-2 focus:ring-amber-400/20"
-                          }`}
-                          autoFocus
-                        />
-                        <button
-                          type="submit"
-                          disabled={!guessInput.trim()}
-                          className="py-3.5 px-6 rounded-2xl bg-gradient-to-r from-amber-400 to-orange-500 hover:brightness-110 active:scale-[0.99] text-slate-950 font-bold text-base transition-all shadow-md shadow-orange-500/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shrink-0"
-                        >
-                          Submit Guess
-                        </button>
-                      </div>
-
-                      {guessFeedback && (
-                        <p
-                          className={`text-xs font-semibold px-2 py-1 rounded-lg ${
-                            isWrongGuess ? "text-rose-400" : "text-emerald-400"
-                          }`}
-                        >
-                          {guessFeedback}
-                        </p>
-                      )}
-                    </form>
-                  )}
+                  <h3 className="text-xl sm:text-2xl font-bold text-white">
+                    You ran out of time this round!
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-2">
+                    Keep answering other players&rsquo; questions until everyone finishes.
+                  </p>
                 </div>
               ) : (
-                // Another player is guessing -> IDENTIFY VISIBLE TO EVERYONE ELSE
-                <div className="w-full mt-4 max-w-lg">
-                  <div className="p-5 sm:p-6 rounded-2xl bg-slate-950 border border-slate-800 text-center">
-                    <span className="text-xs font-bold text-amber-400 uppercase tracking-widest block mb-1">
-                      Their Secret Personality:
+                <div className="w-full">
+                  <div className="p-5 sm:p-6 rounded-2xl bg-amber-400 text-slate-950 font-bold sticky-note text-center">
+                    <span className="text-3xl sm:text-4xl font-black font-mono block mb-1">
+                      ? ? ?
                     </span>
-                    <h3 className="text-2xl sm:text-4xl font-extrabold text-white tracking-wide">
-                      {activeGuesser?.identityName || "Mystery Figure"}
-                    </h3>
-                    {activeGuesser?.identityTag && (
-                      <span className="text-sm text-slate-400 block mt-1">
-                        {activeGuesser.identityCategory} &bull; {activeGuesser.identityTag}
-                      </span>
-                    )}
+                    <span className="text-sm sm:text-base font-extrabold block">
+                      Your identity is stuck to your forehead!
+                    </span>
+                    <p className="text-xs text-amber-950 font-semibold mt-1">
+                      Ask questions aloud to the room: &ldquo;Am I an actor? Am I alive?&rdquo;
+                    </p>
                   </div>
 
-                  <div className="mt-4 p-3 rounded-xl bg-slate-900/60 border border-slate-800/80 text-xs text-slate-300">
-                    🗣️ <span className="font-semibold">{activeGuesser?.name}</span> will ask questions out loud. Answer them truthfully with <strong>Yes</strong>, <strong>No</strong>, or <strong>Maybe</strong>!
-                  </div>
+                  <form onSubmit={handleGuessSubmit} className="mt-5 space-y-2">
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={guessInput}
+                        onChange={(e) => setGuessInput(e.target.value)}
+                        placeholder="Type your guess (e.g. Taylor Swift)..."
+                        className={`flex-1 bg-slate-950 border rounded-2xl px-4 py-3.5 text-white placeholder-slate-500 focus:outline-none text-base transition-all ${
+                          isWrongGuess
+                            ? "border-rose-500 focus:ring-2 focus:ring-rose-500/20 animate-shake"
+                            : "border-slate-700 focus:border-amber-400 focus:ring-2 focus:ring-amber-400/20"
+                        }`}
+                        autoFocus
+                      />
+                      <button
+                        type="submit"
+                        disabled={!guessInput.trim()}
+                        className="py-3.5 px-6 rounded-2xl bg-gradient-to-r from-amber-400 to-orange-500 hover:brightness-110 active:scale-[0.99] text-slate-950 font-bold text-base transition-all shadow-md shadow-orange-500/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shrink-0"
+                      >
+                        Submit Guess
+                      </button>
+                    </div>
+
+                    {guessFeedback && (
+                      <p
+                        className={`text-xs font-semibold px-2 py-1 rounded-lg ${
+                          isWrongGuess ? "text-rose-400" : "text-emerald-400"
+                        }`}
+                      >
+                        {guessFeedback}
+                      </p>
+                    )}
+                  </form>
                 </div>
               )}
             </div>
           </div>
         </section>
 
-        {/* BOTTOM SECTION: ALL PLAYERS TURN QUEUE & STATUS */}
+        {/* BOTTOM SECTION: OTHER PLAYERS' IDENTITIES (ANSWER THEIR QUESTIONS ALOUD) */}
         <section className="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 backdrop-blur-xl">
-          <div className="flex items-center justify-between mb-3 px-1">
+          <div className="flex items-center justify-between mb-4 px-1">
             <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
               <Users className="w-4 h-4 text-cyan-400" />
-              <span>Turn Queue &amp; Player Status</span>
+              <span>Other Players &bull; Look here to answer their questions!</span>
             </h3>
             <span className="text-xs text-slate-500">
-              {players.length} Players in Round
+              {otherPlayers.length} Other Players
             </span>
           </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-            {players.map((p) => {
-              const isCurrent = p.isCurrentTurn;
-              const isDone = p.status === "SOLVED" || p.status === "TIMED_OUT";
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {otherPlayers.map((p) => {
+              const isOtherSolved = p.status === "SOLVED";
+              const isOtherTimedOut = p.status === "TIMED_OUT";
 
               return (
                 <div
                   key={p.id}
-                  className={`p-3 rounded-2xl border transition-all flex flex-col items-center text-center ${
-                    isCurrent
-                      ? "bg-amber-950/40 border-amber-400/80 shadow-md ring-2 ring-amber-400/30"
-                      : isDone
-                      ? "bg-slate-950/40 border-slate-800/60 opacity-80"
-                      : "bg-slate-900/40 border-slate-800"
+                  className={`p-4 rounded-2xl border transition-all flex flex-col justify-between ${
+                    isOtherSolved
+                      ? "bg-emerald-950/20 border-emerald-500/40"
+                      : isOtherTimedOut
+                      ? "bg-slate-950/40 border-slate-800 opacity-70"
+                      : "bg-slate-950 border-slate-800/90"
                   }`}
                 >
-                  <div
-                    className={`w-10 h-10 rounded-xl bg-gradient-to-tr ${getAvatarColor(
-                      p.name
-                    )} flex items-center justify-center text-white font-bold text-xs shadow mb-2`}
-                  >
-                    {getInitials(p.name)}
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2.5">
+                      <div
+                        className={`w-8 h-8 rounded-xl bg-gradient-to-tr ${getAvatarColor(
+                          p.name
+                        )} flex items-center justify-center text-white font-bold text-xs shadow`}
+                      >
+                        {getInitials(p.name)}
+                      </div>
+                      <span className="font-bold text-white text-sm truncate">
+                        {p.name}
+                      </span>
+                    </div>
+
+                    <div>
+                      {isOtherSolved ? (
+                        <span className="px-2 py-0.5 rounded-lg bg-emerald-500/20 text-emerald-400 text-[10px] font-bold">
+                          Solved in {p.completionTimeSeconds}s
+                        </span>
+                      ) : isOtherTimedOut ? (
+                        <span className="px-2 py-0.5 rounded-lg bg-rose-500/20 text-rose-400 text-[10px] font-bold">
+                          Timed Out
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded-lg bg-amber-400/20 text-amber-300 text-[10px] font-semibold animate-pulse">
+                          Guessing...
+                        </span>
+                      )}
+                    </div>
                   </div>
 
-                  <span className="font-semibold text-white text-xs truncate max-w-full block">
-                    {p.name} {p.id === self.id && "(You)"}
-                  </span>
-
-                  <div className="mt-1.5">
-                    {isCurrent ? (
-                      <span className="px-2 py-0.5 rounded-lg bg-amber-400 text-slate-950 text-[10px] font-black uppercase tracking-wider animate-pulse">
-                        Guessing
-                      </span>
-                    ) : p.status === "SOLVED" ? (
-                      <span className="px-2 py-0.5 rounded-lg bg-emerald-500/20 text-emerald-400 text-[10px] font-bold">
-                        {p.completionTimeSeconds}s
-                      </span>
-                    ) : p.status === "TIMED_OUT" ? (
-                      <span className="px-2 py-0.5 rounded-lg bg-rose-500/20 text-rose-400 text-[10px] font-bold">
-                        Timed Out
-                      </span>
-                    ) : (
-                      <span className="px-2 py-0.5 rounded-lg bg-slate-800 text-slate-400 text-[10px]">
-                        Waiting
+                  <div className="bg-slate-900/90 rounded-xl p-3 border border-slate-800 text-center mt-1">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest block">
+                      Assigned Identity
+                    </span>
+                    <span className="text-base sm:text-lg font-black text-amber-300 block">
+                      {p.identityName || "Mystery Identity"}
+                    </span>
+                    {p.identityTag && (
+                      <span className="text-[11px] text-slate-400 block truncate mt-0.5">
+                        {p.identityTag}
                       </span>
                     )}
                   </div>

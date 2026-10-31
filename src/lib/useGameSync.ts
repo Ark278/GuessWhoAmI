@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { GameStateResponse } from "./types";
 import { supabase, isSupabaseConfigured } from "./supabase";
 
@@ -48,7 +48,7 @@ export function useGameSync(roomCode: string, initialSessionToken?: string) {
     return () => clearInterval(interval);
   }, [fetchState]);
 
-  // Supabase Realtime subscription if available
+  // Supabase Realtime subscription on public rooms table
   useEffect(() => {
     if (!isSupabaseConfigured || !supabase || !roomCode) return;
 
@@ -62,16 +62,6 @@ export function useGameSync(roomCode: string, initialSessionToken?: string) {
         { event: "*", schema: "public", table: "rooms", filter: `code=eq.${roomCode.toUpperCase()}` },
         () => fetchState()
       )
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "players" },
-        () => fetchState()
-      )
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "round_assignments" },
-        () => fetchState()
-      )
       .subscribe();
 
     return () => {
@@ -81,14 +71,15 @@ export function useGameSync(roomCode: string, initialSessionToken?: string) {
     };
   }, [roomCode, fetchState]);
 
-  // Synchronized Countdown Timer (120 seconds authoritative calculation for the active turn)
+  // Synchronized Countdown Timer (120 seconds for simultaneous guessing)
   useEffect(() => {
-    if (!gameState || gameState.room.status !== "PLAYING" || !gameState.room.turnStartTime) {
+    const startTimeStr = gameState?.room.roundStartTime;
+    if (!gameState || gameState.room.status !== "PLAYING" || !startTimeStr) {
       setTimeRemaining(120);
       return;
     }
 
-    const startTimestamp = new Date(gameState.room.turnStartTime).getTime();
+    const startTimestamp = new Date(startTimeStr).getTime();
 
     const updateTimer = () => {
       const now = Date.now();

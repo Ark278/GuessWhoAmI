@@ -1,7 +1,7 @@
 import { Room, Player, RoundAssignment, GameStateResponse, PlayerPublicView } from "./types";
 import { IDENTITIES, Identity } from "./identities";
 import { isCorrectGuess } from "./normalize";
-import { supabaseAdmin, getSupabaseAdmin, isSupabaseConfigured } from "./supabase";
+import { getSupabaseAdmin, isSupabaseAdminConfigured } from "./supabase-admin";
 
 export function formatDbError(err: any): string {
   if (!err) return "Unknown database error";
@@ -11,6 +11,16 @@ export function formatDbError(err: any): string {
   if (err.details && err.details.trim()) parts.push(`Details: ${err.details.trim()}`);
   if (err.hint && err.hint.trim()) parts.push(`Hint: ${err.hint.trim()}`);
   return parts.length > 0 ? parts.join(" | ") : (typeof err === "string" ? err : JSON.stringify(err));
+}
+
+function logDbError(operation: string, err: any) {
+  if (!err) return;
+  console.error(`[Database Error] ${operation}:`, {
+    code: err.code,
+    message: err.message,
+    details: err.details,
+    hint: err.hint,
+  });
 }
 
 interface MemoryDB {
@@ -48,7 +58,7 @@ function shuffle<T>(array: T[]): T[] {
 }
 
 export class GameService {
-  // 1. CREATE ROOM
+  // 1. ATOMIC CREATE ROOM & HOST PLAYER
   static async createRoom(hostName: string): Promise<{ room: Room; player: Player }> {
     const trimmedName = hostName.trim();
     if (!trimmedName) throw new Error("Display name is required");
@@ -82,9 +92,35 @@ export class GameService {
       createdAt: now,
     };
 
-    const admin = getSupabaseAdmin() || supabaseAdmin;
+    if (isSupabaseAdminConfigured()) {
+      const admin = getSupabaseAdmin();
+      if (!admin) throw new Error("Database admin client unavailable in production");
 
-    if (isSupabaseConfigured && admin) {
+      // 1. Attempt atomic RPC creation
+      const { data: rpcData, error: rpcErr } = await admin.rpc("create_room_and_host", {
+        p_code: code,
+        p_room_id: roomId,
+        p_host_player_id: playerId,
+        p_host_name: trimmedName,
+        p_session_token: sessionToken,
+      });
+
+      if (!rpcErr && rpcData) {
+        return { room, player };
+      }
+
+      // If in production, NEVER fall back to non-atomic creation
+      if (rpcErr) {
+        logDbError("createRoom (rpc create_room_and_host)", rpcErr);
+        if (process.env.NODE_ENV === "production") {
+          throw new Error(
+            `Database error creating room: Atomic procedure create_room_and_host failed (${formatDbError(
+              rpcErr
+            )}). Non-atomic fallback is forbidden in production.`
+          );
+        }
+      }
+
       const { error: roomErr } = await admin.from("rooms").insert({
         id: roomId,
         code,
@@ -94,12 +130,7 @@ export class GameService {
       });
 
       if (roomErr) {
-        console.error("[Database Error] createRoom (table: rooms):", {
-          code: roomErr.code,
-          message: roomErr.message,
-          details: roomErr.details,
-          hint: roomErr.hint,
-        });
+        logDbError("createRoom (table: rooms)", roomErr);
         throw new Error(`Database error creating room: ${formatDbError(roomErr)}`);
       }
 
@@ -113,15 +144,15 @@ export class GameService {
       });
 
       if (playerErr) {
-        console.error("[Database Error] createRoom (table: players):", {
-          code: playerErr.code,
-          message: playerErr.message,
-          details: playerErr.details,
-          hint: playerErr.hint,
-        });
+        logDbError("createRoom (table: players)", playerErr);
+        // Rollback created room to prevent orphaned room records
+        await admin.from("rooms").delete().eq("id", roomId);
         throw new Error(`Database error creating player: ${formatDbError(playerErr)}`);
       }
     } else {
+      if (process.env.NODE_ENV === "production") {
+        throw new Error("CRITICAL: Supabase is required in production. In-memory mode is disabled.");
+      }
       memoryDB.rooms.set(code, room);
       memoryDB.players.set(roomId, [player]);
       memoryDB.usedIdentityIds.set(roomId, new Set());
@@ -140,13 +171,22 @@ export class GameService {
     let room: Room | null = null;
     let players: Player[] = [];
 
-    if (isSupabaseConfigured && supabaseAdmin) {
-      const { data: roomData, error: roomErr } = await supabaseAdmin
+    if (isSupabaseAdminConfigured()) {
+      const admin = getSupabaseAdmin();
+      if (!admin) throw new Error("Database admin client unavailable");
+
+      const { data: roomData, error: roomErr } = await admin
         .from("rooms")
         .select("*")
         .eq("code", upperCode)
         .single();
-      if (roomErr || !roomData) throw new Error("Room not found. Please check the code.");
+
+      if (roomErr || !roomData) {
+        if (roomErr && roomErr.code !== "PGRST116") {
+          logDbError("joinRoom (table: rooms select)", roomErr);
+        }
+        throw new Error("Room not found. Please check the code.");
+      }
 
       room = {
         id: roomData.id,
@@ -161,10 +201,15 @@ export class GameService {
         updatedAt: roomData.updated_at,
       };
 
-      const { data: playersData } = await supabaseAdmin
+      const { data: playersData, error: playersErr } = await admin
         .from("players")
         .select("*")
         .eq("room_id", room.id);
+
+      if (playersErr) {
+        logDbError("joinRoom (table: players select)", playersErr);
+      }
+
       players = (playersData || []).map((p: any) => ({
         id: p.id,
         roomId: p.room_id,
@@ -175,6 +220,9 @@ export class GameService {
         createdAt: p.created_at,
       }));
     } else {
+      if (process.env.NODE_ENV === "production") {
+        throw new Error("CRITICAL: Supabase is required in production.");
+      }
       room = memoryDB.rooms.get(upperCode) || null;
       if (!room) throw new Error("Room not found. Please check the code.");
       players = memoryDB.players.get(room.id) || [];
@@ -209,8 +257,11 @@ export class GameService {
       createdAt: now,
     };
 
-    if (isSupabaseConfigured && supabaseAdmin) {
-      const { error: insertErr } = await supabaseAdmin.from("players").insert({
+    if (isSupabaseAdminConfigured()) {
+      const admin = getSupabaseAdmin();
+      if (!admin) throw new Error("Database admin client unavailable");
+
+      const { error: insertErr } = await admin.from("players").insert({
         id: playerId,
         room_id: room.id,
         name: trimmedName,
@@ -218,7 +269,14 @@ export class GameService {
         is_host: false,
         session_token: sessionToken,
       });
-      if (insertErr) throw new Error(insertErr.message);
+
+      if (insertErr) {
+        logDbError("joinRoom (table: players insert)", insertErr);
+        throw new Error(formatDbError(insertErr));
+      }
+
+      // Touch rooms.updated_at so Realtime instantly notifies other players in the room
+      await admin.from("rooms").update({ updated_at: now }).eq("id", room.id);
     } else {
       players.push(newPlayer);
       memoryDB.players.set(room.id, players);
@@ -231,23 +289,41 @@ export class GameService {
   static async setReady(code: string, sessionToken: string, isReady: boolean): Promise<boolean> {
     const upperCode = code.trim().toUpperCase();
 
-    if (isSupabaseConfigured && supabaseAdmin) {
-      const { data: room } = await supabaseAdmin
+    if (isSupabaseAdminConfigured()) {
+      const admin = getSupabaseAdmin();
+      if (!admin) throw new Error("Database admin client unavailable");
+
+      const { data: room, error: roomErr } = await admin
         .from("rooms")
         .select("id")
         .eq("code", upperCode)
         .single();
-      if (!room) throw new Error("Room not found");
 
-      const { error } = await supabaseAdmin
+      if (roomErr || !room) {
+        if (roomErr && roomErr.code !== "PGRST116") {
+          logDbError("setReady (table: rooms select)", roomErr);
+        }
+        throw new Error("Room not found");
+      }
+
+      const { error } = await admin
         .from("players")
         .update({ is_ready: isReady })
         .eq("room_id", room.id)
         .eq("session_token", sessionToken);
 
-      if (error) throw new Error(error.message);
+      if (error) {
+        logDbError("setReady (table: players update)", error);
+        throw new Error(formatDbError(error));
+      }
+
+      // Touch rooms.updated_at so Realtime instantly notifies all lobby clients
+      await admin.from("rooms").update({ updated_at: new Date().toISOString() }).eq("id", room.id);
       return true;
     } else {
+      if (process.env.NODE_ENV === "production") {
+        throw new Error("CRITICAL: Supabase is required in production.");
+      }
       const room = memoryDB.rooms.get(upperCode);
       if (!room) throw new Error("Room not found");
       const players = memoryDB.players.get(room.id) || [];
@@ -258,20 +334,28 @@ export class GameService {
     }
   }
 
-  // 4. START GAME (TURN-BASED SEQUENTIAL SELECTION)
+  // 4. START GAME (SIMULTANEOUS GUESSING: ALL PLAYERS PLAY AT ONCE)
   static async startGame(code: string, sessionToken: string): Promise<boolean> {
     const upperCode = code.trim().toUpperCase();
 
     let room: Room;
     let players: Player[];
 
-    if (isSupabaseConfigured && supabaseAdmin) {
-      const { data: roomData } = await supabaseAdmin
+    if (isSupabaseAdminConfigured()) {
+      const admin = getSupabaseAdmin();
+      if (!admin) throw new Error("Database admin client unavailable");
+
+      const { data: roomData, error: roomErr } = await admin
         .from("rooms")
         .select("*")
         .eq("code", upperCode)
         .single();
-      if (!roomData) throw new Error("Room not found");
+
+      if (roomErr || !roomData) {
+        logDbError("startGame (table: rooms select)", roomErr);
+        throw new Error("Room not found");
+      }
+
       room = {
         id: roomData.id,
         code: roomData.code,
@@ -285,10 +369,15 @@ export class GameService {
         updatedAt: roomData.updated_at,
       };
 
-      const { data: playersData } = await supabaseAdmin
+      const { data: playersData, error: playersErr } = await admin
         .from("players")
         .select("*")
         .eq("room_id", room.id);
+
+      if (playersErr) {
+        logDbError("startGame (table: players select)", playersErr);
+      }
+
       players = (playersData || []).map((p: any) => ({
         id: p.id,
         roomId: p.room_id,
@@ -299,6 +388,9 @@ export class GameService {
         createdAt: p.created_at,
       }));
     } else {
+      if (process.env.NODE_ENV === "production") {
+        throw new Error("CRITICAL: Supabase is required in production.");
+      }
       const foundRoom = memoryDB.rooms.get(upperCode);
       if (!foundRoom) throw new Error("Room not found");
       room = foundRoom;
@@ -321,7 +413,7 @@ export class GameService {
 
     // Pick unique identities
     let usedIds = new Set<string>();
-    if (!isSupabaseConfigured) {
+    if (!isSupabaseAdminConfigured()) {
       usedIds = memoryDB.usedIdentityIds.get(room.id) || new Set();
     }
 
@@ -335,15 +427,11 @@ export class GameService {
     const roundNumber = room.currentRound;
     const now = new Date().toISOString();
 
-    // Randomly select one player to start the guessing turn
-    const shuffledPlayers = shuffle(players);
-    const firstTurnPlayer = shuffledPlayers[0];
-
+    // In simultaneous mode, ALL players start with status "PLAYING"
     const assignments: RoundAssignment[] = [];
     players.forEach((player, idx) => {
       const identity = shuffled[idx];
       usedIds.add(identity.id);
-      const isFirstTurn = player.id === firstTurnPlayer.id;
 
       assignments.push({
         id: crypto.randomUUID(),
@@ -355,13 +443,16 @@ export class GameService {
         identityCategory: identity.category,
         identityTag: identity.tag,
         identityAliases: identity.aliases,
-        status: isFirstTurn ? "PLAYING" : "WAITING_TURN",
+        status: "PLAYING",
         solvedAt: null,
         completionTimeSeconds: null,
       });
     });
 
-    if (isSupabaseConfigured && supabaseAdmin) {
+    if (isSupabaseAdminConfigured()) {
+      const admin = getSupabaseAdmin();
+      if (!admin) throw new Error("Database admin client unavailable");
+
       const insertRows = assignments.map((a) => ({
         id: a.id,
         room_id: a.roomId,
@@ -374,23 +465,29 @@ export class GameService {
         identity_aliases: a.identityAliases,
         status: a.status,
       }));
-      await supabaseAdmin.from("round_assignments").insert(insertRows);
 
-      await supabaseAdmin
+      const { error: assignErr } = await admin.from("round_assignments").insert(insertRows);
+      if (assignErr) {
+        logDbError("startGame (table: round_assignments insert)", assignErr);
+        throw new Error(formatDbError(assignErr));
+      }
+
+      const { error: roomUpErr } = await admin
         .from("rooms")
         .update({
           status: "PLAYING",
           round_start_time: now,
-          current_turn_player_id: firstTurnPlayer.id,
-          turn_start_time: now,
           updated_at: now,
         })
         .eq("id", room.id);
+
+      if (roomUpErr) {
+        logDbError("startGame (table: rooms update)", roomUpErr);
+        throw new Error(formatDbError(roomUpErr));
+      }
     } else {
       room.status = "PLAYING";
       room.roundStartTime = now;
-      room.currentTurnPlayerId = firstTurnPlayer.id;
-      room.turnStartTime = now;
       room.updatedAt = now;
       memoryDB.assignments.set(`${room.id}_${roundNumber}`, assignments);
       memoryDB.usedIdentityIds.set(room.id, usedIds);
@@ -399,41 +496,12 @@ export class GameService {
     return true;
   }
 
-  // Helper: Advance to next unattempted player or finish round
-  private static advanceNextTurn(
-    room: Room,
-    assignments: RoundAssignment[],
-    players: Player[]
-  ): string | null {
-    // Find players who are still WAITING_TURN
-    const remainingWaiting = assignments.filter((a) => a.status === "WAITING_TURN");
-
-    if (remainingWaiting.length > 0) {
-      // Randomly pick one among the remaining waiting players
-      const nextAssignment = remainingWaiting[Math.floor(Math.random() * remainingWaiting.length)];
-      nextAssignment.status = "PLAYING";
-      const now = new Date().toISOString();
-      room.currentTurnPlayerId = nextAssignment.playerId;
-      room.turnStartTime = now;
-      room.updatedAt = now;
-      return nextAssignment.playerId;
-    } else {
-      // Everyone has had a go!
-      const now = new Date().toISOString();
-      room.status = "RESULTS";
-      room.currentTurnPlayerId = null;
-      room.turnStartTime = null;
-      room.updatedAt = now;
-      return null;
-    }
-  }
-
-  // 5. SUBMIT GUESS
+  // 5. SUBMIT GUESS (CONCURRENT SIMULTANEOUS GUESSES FROM ANY ACTIVE PLAYER)
   static async submitGuess(
     code: string,
     sessionToken: string,
     guess: string
-  ): Promise<{ correct: boolean; identityName?: string; completionTime?: number; nextPlayerId?: string | null }> {
+  ): Promise<{ correct: boolean; identityName?: string; completionTime?: number }> {
     const upperCode = code.trim().toUpperCase();
     const cleanGuess = (guess || "").trim();
     if (!cleanGuess) return { correct: false };
@@ -442,13 +510,17 @@ export class GameService {
     let players: Player[];
     let assignments: RoundAssignment[];
 
-    if (isSupabaseConfigured && supabaseAdmin) {
-      const { data: roomData } = await supabaseAdmin
+    if (isSupabaseAdminConfigured()) {
+      const admin = getSupabaseAdmin();
+      if (!admin) throw new Error("Database admin client unavailable");
+
+      const { data: roomData, error: roomErr } = await admin
         .from("rooms")
         .select("*")
         .eq("code", upperCode)
         .single();
-      if (!roomData) throw new Error("Room not found");
+      if (roomErr || !roomData) throw new Error("Room not found");
+
       room = {
         id: roomData.id,
         code: roomData.code,
@@ -462,10 +534,12 @@ export class GameService {
         updatedAt: roomData.updated_at,
       };
 
-      const { data: playersData } = await supabaseAdmin
+      const { data: playersData, error: playersErr } = await admin
         .from("players")
         .select("*")
         .eq("room_id", room.id);
+      if (playersErr) logDbError("submitGuess (table: players select)", playersErr);
+
       players = (playersData || []).map((p: any) => ({
         id: p.id,
         roomId: p.room_id,
@@ -476,11 +550,13 @@ export class GameService {
         createdAt: p.created_at,
       }));
 
-      const { data: assignData } = await supabaseAdmin
+      const { data: assignData, error: assignErr } = await admin
         .from("round_assignments")
         .select("*")
         .eq("room_id", room.id)
         .eq("round_number", room.currentRound);
+      if (assignErr) logDbError("submitGuess (table: round_assignments select)", assignErr);
+
       assignments = (assignData || []).map((a: any) => ({
         id: a.id,
         roomId: a.room_id,
@@ -496,6 +572,9 @@ export class GameService {
         completionTimeSeconds: a.completion_time_seconds,
       }));
     } else {
+      if (process.env.NODE_ENV === "production") {
+        throw new Error("CRITICAL: Supabase is required in production.");
+      }
       const foundRoom = memoryDB.rooms.get(upperCode);
       if (!foundRoom) throw new Error("Room not found");
       room = foundRoom;
@@ -510,14 +589,10 @@ export class GameService {
     const player = players.find((p) => p.sessionToken === sessionToken);
     if (!player) throw new Error("Invalid session token");
 
-    // Enforce that ONLY the currently selected player can submit guesses!
-    if (room.currentTurnPlayerId !== player.id) {
-      throw new Error("It is not your turn to guess!");
-    }
-
     const playerAssignment = assignments.find((a) => a.playerId === player.id);
     if (!playerAssignment) throw new Error("No assignment found for player in this round.");
 
+    // If player has already solved or timed out, return their status
     if (playerAssignment.status !== "PLAYING") {
       return {
         correct: playerAssignment.status === "SOLVED",
@@ -526,40 +601,46 @@ export class GameService {
       };
     }
 
-    // Check individual turn timer (120s from turnStartTime)
+    // Check individual player timer (120s from roundStartTime)
     const now = new Date();
-    const startTime = room.turnStartTime ? new Date(room.turnStartTime) : now;
+    const startTime = room.roundStartTime ? new Date(room.roundStartTime) : now;
     const elapsedSeconds = Math.max(0, (now.getTime() - startTime.getTime()) / 1000);
 
     if (elapsedSeconds > 120) {
       playerAssignment.status = "TIMED_OUT";
-      const nextPlayerId = GameService.advanceNextTurn(room, assignments, players);
 
-      if (isSupabaseConfigured && supabaseAdmin) {
-        await supabaseAdmin
-          .from("round_assignments")
-          .update({ status: "TIMED_OUT" })
-          .eq("id", playerAssignment.id);
+      // Check if all players have now completed their turns
+      const allFinished = assignments.every(
+        (a) => (a.playerId === player.id ? "TIMED_OUT" : a.status) !== "PLAYING"
+      );
 
-        if (nextPlayerId) {
-          await supabaseAdmin
+      if (isSupabaseAdminConfigured()) {
+        const admin = getSupabaseAdmin();
+        if (admin) {
+          const { error: toErr } = await admin
             .from("round_assignments")
-            .update({ status: "PLAYING" })
-            .eq("room_id", room.id)
-            .eq("round_number", room.currentRound)
-            .eq("player_id", nextPlayerId);
-        }
+            .update({ status: "TIMED_OUT" })
+            .eq("id", playerAssignment.id)
+            .eq("status", "PLAYING");
+          if (toErr) logDbError("submitGuess timeout (table: round_assignments update)", toErr);
 
-        await supabaseAdmin
-          .from("rooms")
-          .update({
-            status: room.status,
-            current_turn_player_id: room.currentTurnPlayerId,
-            turn_start_time: room.turnStartTime,
-            updated_at: room.updatedAt,
-          })
-          .eq("id", room.id);
+          // Touch rooms.updated_at to notify all clients via Realtime
+          const { error: roomErr } = await admin
+            .from("rooms")
+            .update({
+              updated_at: now.toISOString(),
+              ...(allFinished ? { status: "RESULTS" } : {}),
+            })
+            .eq("id", room.id);
+          if (roomErr) logDbError("submitGuess timeout room update (table: rooms update)", roomErr);
+        }
+      } else {
+        if (allFinished) {
+          room.status = "RESULTS";
+          room.updatedAt = now.toISOString();
+        }
       }
+
       return { correct: false };
     }
 
@@ -580,51 +661,53 @@ export class GameService {
       playerAssignment.solvedAt = now.toISOString();
       playerAssignment.completionTimeSeconds = completionTime;
 
-      // Advance to next remaining player or finish round
-      const nextPlayerId = GameService.advanceNextTurn(room, assignments, players);
+      // Check if all players have now completed
+      const allFinished = assignments.every(
+        (a) => (a.playerId === player.id ? "SOLVED" : a.status) !== "PLAYING"
+      );
 
-      if (isSupabaseConfigured && supabaseAdmin) {
-        await supabaseAdmin
-          .from("round_assignments")
-          .update({
-            status: "SOLVED",
-            solved_at: now.toISOString(),
-            completion_time_seconds: completionTime,
-          })
-          .eq("id", playerAssignment.id);
-
-        if (nextPlayerId) {
-          await supabaseAdmin
+      if (isSupabaseAdminConfigured()) {
+        const admin = getSupabaseAdmin();
+        if (admin) {
+          const { error: solveErr } = await admin
             .from("round_assignments")
-            .update({ status: "PLAYING" })
-            .eq("room_id", room.id)
-            .eq("round_number", room.currentRound)
-            .eq("player_id", nextPlayerId);
-        }
+            .update({
+              status: "SOLVED",
+              solved_at: now.toISOString(),
+              completion_time_seconds: completionTime,
+            })
+            .eq("id", playerAssignment.id)
+            .eq("status", "PLAYING");
+          if (solveErr) logDbError("submitGuess solve (table: round_assignments update)", solveErr);
 
-        await supabaseAdmin
-          .from("rooms")
-          .update({
-            status: room.status,
-            current_turn_player_id: room.currentTurnPlayerId,
-            turn_start_time: room.turnStartTime,
-            updated_at: room.updatedAt,
-          })
-          .eq("id", room.id);
+          // Touch rooms.updated_at to notify all clients via Realtime
+          const { error: roomErr } = await admin
+            .from("rooms")
+            .update({
+              updated_at: now.toISOString(),
+              ...(allFinished ? { status: "RESULTS" } : {}),
+            })
+            .eq("id", room.id);
+          if (roomErr) logDbError("submitGuess all finished (table: rooms update)", roomErr);
+        }
+      } else {
+        if (allFinished) {
+          room.status = "RESULTS";
+          room.updatedAt = now.toISOString();
+        }
       }
 
       return {
         correct: true,
         identityName: playerAssignment.identityName,
         completionTime,
-        nextPlayerId,
       };
     }
 
     return { correct: false };
   }
 
-  // 6. GET GAME STATE
+  // 6. GET GAME STATE WITH PRIVACY-PRESERVING FILTERING
   static async getGameState(code: string, sessionToken?: string): Promise<GameStateResponse> {
     const upperCode = code.trim().toUpperCase();
 
@@ -632,13 +715,17 @@ export class GameService {
     let players: Player[];
     let assignments: RoundAssignment[];
 
-    if (isSupabaseConfigured && supabaseAdmin) {
-      const { data: roomData } = await supabaseAdmin
+    if (isSupabaseAdminConfigured()) {
+      const admin = getSupabaseAdmin();
+      if (!admin) throw new Error("Database admin client unavailable");
+
+      const { data: roomData, error: roomErr } = await admin
         .from("rooms")
         .select("*")
         .eq("code", upperCode)
         .single();
-      if (!roomData) throw new Error("Room not found");
+      if (roomErr || !roomData) throw new Error("Room not found");
+
       room = {
         id: roomData.id,
         code: roomData.code,
@@ -652,11 +739,13 @@ export class GameService {
         updatedAt: roomData.updated_at,
       };
 
-      const { data: playersData } = await supabaseAdmin
+      const { data: playersData, error: playersErr } = await admin
         .from("players")
         .select("*")
         .eq("room_id", room.id)
         .order("created_at", { ascending: true });
+      if (playersErr) logDbError("getGameState (table: players select)", playersErr);
+
       players = (playersData || []).map((p: any) => ({
         id: p.id,
         roomId: p.room_id,
@@ -667,11 +756,13 @@ export class GameService {
         createdAt: p.created_at,
       }));
 
-      const { data: assignData } = await supabaseAdmin
+      const { data: assignData, error: assignErr } = await admin
         .from("round_assignments")
         .select("*")
         .eq("room_id", room.id)
         .eq("round_number", room.currentRound);
+      if (assignErr) logDbError("getGameState (table: round_assignments select)", assignErr);
+
       assignments = (assignData || []).map((a: any) => ({
         id: a.id,
         roomId: a.room_id,
@@ -687,6 +778,9 @@ export class GameService {
         completionTimeSeconds: a.completion_time_seconds,
       }));
     } else {
+      if (process.env.NODE_ENV === "production") {
+        throw new Error("CRITICAL: Supabase is required in production.");
+      }
       const foundRoom = memoryDB.rooms.get(upperCode);
       if (!foundRoom) throw new Error("Room not found");
       room = foundRoom;
@@ -694,42 +788,42 @@ export class GameService {
       assignments = memoryDB.assignments.get(`${room.id}_${room.currentRound}`) || [];
     }
 
-    // Auto timeout check on active turn player
+    // Auto timeout check on active simultaneous players (120 seconds)
     const now = new Date();
-    if (room.status === "PLAYING" && room.turnStartTime && room.currentTurnPlayerId) {
-      const startTime = new Date(room.turnStartTime);
+    if (room.status === "PLAYING" && room.roundStartTime) {
+      const startTime = new Date(room.roundStartTime);
       const elapsedSeconds = (now.getTime() - startTime.getTime()) / 1000;
+
       if (elapsedSeconds >= 120) {
-        const activeAssignment = assignments.find((a) => a.playerId === room.currentTurnPlayerId);
-        if (activeAssignment && activeAssignment.status === "PLAYING") {
-          activeAssignment.status = "TIMED_OUT";
+        let hasChanges = false;
+        const timedOutAssignmentIds: string[] = [];
 
-          const nextPlayerId = GameService.advanceNextTurn(room, assignments, players);
+        assignments.forEach((a) => {
+          if (a.status === "PLAYING") {
+            a.status = "TIMED_OUT";
+            hasChanges = true;
+            timedOutAssignmentIds.push(a.id);
+          }
+        });
 
-          if (isSupabaseConfigured && supabaseAdmin) {
-            await supabaseAdmin
-              .from("round_assignments")
-              .update({ status: "TIMED_OUT" })
-              .eq("id", activeAssignment.id);
+        if (hasChanges) {
+          room.status = "RESULTS";
+          room.updatedAt = now.toISOString();
 
-            if (nextPlayerId) {
-              await supabaseAdmin
-                .from("round_assignments")
-                .update({ status: "PLAYING" })
-                .eq("room_id", room.id)
-                .eq("round_number", room.currentRound)
-                .eq("player_id", nextPlayerId);
+          if (isSupabaseAdminConfigured()) {
+            const admin = getSupabaseAdmin();
+            if (admin) {
+              if (timedOutAssignmentIds.length > 0) {
+                await admin
+                  .from("round_assignments")
+                  .update({ status: "TIMED_OUT" })
+                  .in("id", timedOutAssignmentIds);
+              }
+              await admin
+                .from("rooms")
+                .update({ status: "RESULTS", updated_at: now.toISOString() })
+                .eq("id", room.id);
             }
-
-            await supabaseAdmin
-              .from("rooms")
-              .update({
-                status: room.status,
-                current_turn_player_id: room.currentTurnPlayerId,
-                turn_start_time: room.turnStartTime,
-                updated_at: room.updatedAt,
-              })
-              .eq("id", room.id);
           }
         }
       }
@@ -741,30 +835,12 @@ export class GameService {
     const isRoomFinished = room.status === "RESULTS";
     const isSelfSolved = selfAssignment?.status === "SOLVED";
 
-    // Find current active turn player details
-    const activeTurnPlayer = players.find((p) => p.id === room.currentTurnPlayerId) || null;
-    const activeTurnAssignment = assignments.find((a) => a.playerId === room.currentTurnPlayerId) || null;
-
-    const isActiveSelf = activeTurnPlayer?.id === selfPlayer?.id;
-    const showActiveIdentityToSelf = isRoomFinished || (isActiveSelf && isSelfSolved);
-
-    const currentTurnPlayerInfo = activeTurnPlayer
-      ? {
-          id: activeTurnPlayer.id,
-          name: activeTurnPlayer.name,
-          identityName: !isActiveSelf || showActiveIdentityToSelf ? activeTurnAssignment?.identityName || null : null,
-          identityCategory: !isActiveSelf || showActiveIdentityToSelf ? activeTurnAssignment?.identityCategory || null : null,
-          identityTag: !isActiveSelf || showActiveIdentityToSelf ? activeTurnAssignment?.identityTag || null : null,
-          isSelf: isActiveSelf,
-        }
-      : null;
-
-    // Build public players view with strictly enforced identity visibility
+    // Strictly enforce identity visibility:
+    // A player NEVER receives their own identity until they have SOLVED it or the round ends in RESULTS.
+    // Session tokens are NEVER included in public player views.
     const publicPlayers: PlayerPublicView[] = players.map((player) => {
       const assignment = assignments.find((a) => a.playerId === player.id);
       const isSelf = player.id === selfPlayer?.id;
-      const isCurrentTurn = player.id === room.currentTurnPlayerId;
-
       const shouldReveal = !isSelf || isRoomFinished || (isSelf && isSelfSolved);
 
       return {
@@ -772,10 +848,10 @@ export class GameService {
         name: player.name,
         isReady: player.isReady,
         isHost: player.isHost,
-        isCurrentTurn,
-        status: assignment?.status || "WAITING_TURN",
+        isCurrentTurn: assignment?.status === "PLAYING",
+        status: assignment?.status || "PLAYING",
         solvedAt: assignment?.solvedAt || null,
-        completionTimeSeconds: assignment?.completionTimeSeconds || null,
+        completionTimeSeconds: typeof assignment?.completionTimeSeconds === "number" ? assignment.completionTimeSeconds : null,
         identityName: shouldReveal ? assignment?.identityName || null : null,
         identityCategory: shouldReveal ? assignment?.identityCategory || null : null,
         identityTag: shouldReveal ? assignment?.identityTag || null : null,
@@ -790,8 +866,8 @@ export class GameService {
         status: room.status,
         currentRound: room.currentRound,
         roundStartTime: room.roundStartTime,
-        currentTurnPlayerId: room.currentTurnPlayerId,
-        turnStartTime: room.turnStartTime,
+        currentTurnPlayerId: null,
+        turnStartTime: null,
         isHost: selfPlayer?.isHost || false,
       },
       self: {
@@ -799,10 +875,10 @@ export class GameService {
         name: selfPlayer?.name || "",
         isReady: selfPlayer?.isReady || false,
         isHost: selfPlayer?.isHost || false,
-        isCurrentTurn: selfPlayer?.id === room.currentTurnPlayerId,
-        status: selfAssignment?.status || "WAITING_TURN",
+        isCurrentTurn: selfAssignment?.status === "PLAYING",
+        status: selfAssignment?.status || "PLAYING",
         solvedAt: selfAssignment?.solvedAt || null,
-        completionTimeSeconds: selfAssignment?.completionTimeSeconds || null,
+        completionTimeSeconds: typeof selfAssignment?.completionTimeSeconds === "number" ? selfAssignment.completionTimeSeconds : null,
         revealedIdentity:
           isSelfSolved || isRoomFinished
             ? {
@@ -812,26 +888,30 @@ export class GameService {
               }
             : null,
       },
-      currentTurnPlayer: currentTurnPlayerInfo,
+      currentTurnPlayer: null,
       players: publicPlayers,
       serverTime: now.toISOString(),
     };
   }
 
-  // 7. NEXT ROUND
+  // 7. ADVANCE TO NEXT ROUND
   static async nextRound(code: string, sessionToken: string): Promise<boolean> {
     const upperCode = code.trim().toUpperCase();
 
     let room: Room;
     let players: Player[];
 
-    if (isSupabaseConfigured && supabaseAdmin) {
-      const { data: roomData } = await supabaseAdmin
+    if (isSupabaseAdminConfigured()) {
+      const admin = getSupabaseAdmin();
+      if (!admin) throw new Error("Database admin client unavailable");
+
+      const { data: roomData, error: roomErr } = await admin
         .from("rooms")
         .select("*")
         .eq("code", upperCode)
         .single();
-      if (!roomData) throw new Error("Room not found");
+      if (roomErr || !roomData) throw new Error("Room not found");
+
       room = {
         id: roomData.id,
         code: roomData.code,
@@ -845,10 +925,12 @@ export class GameService {
         updatedAt: roomData.updated_at,
       };
 
-      const { data: playersData } = await supabaseAdmin
+      const { data: playersData, error: playersErr } = await admin
         .from("players")
         .select("*")
         .eq("room_id", room.id);
+      if (playersErr) logDbError("nextRound (table: players select)", playersErr);
+
       players = (playersData || []).map((p: any) => ({
         id: p.id,
         roomId: p.room_id,
@@ -859,6 +941,9 @@ export class GameService {
         createdAt: p.created_at,
       }));
     } else {
+      if (process.env.NODE_ENV === "production") {
+        throw new Error("CRITICAL: Supabase is required in production.");
+      }
       const foundRoom = memoryDB.rooms.get(upperCode);
       if (!foundRoom) throw new Error("Room not found");
       room = foundRoom;
@@ -879,7 +964,7 @@ export class GameService {
     const now = new Date().toISOString();
 
     let usedIds = new Set<string>();
-    if (!isSupabaseConfigured) {
+    if (!isSupabaseAdminConfigured()) {
       usedIds = memoryDB.usedIdentityIds.get(room.id) || new Set();
     }
 
@@ -890,15 +975,11 @@ export class GameService {
     }
 
     const shuffled = shuffle(availableIdentities);
-    const shuffledPlayers = shuffle(players);
-    const firstTurnPlayer = shuffledPlayers[0];
-
     const assignments: RoundAssignment[] = [];
 
     players.forEach((player, idx) => {
       const identity = shuffled[idx];
       usedIds.add(identity.id);
-      const isFirstTurn = player.id === firstTurnPlayer.id;
 
       assignments.push({
         id: crypto.randomUUID(),
@@ -910,13 +991,16 @@ export class GameService {
         identityCategory: identity.category,
         identityTag: identity.tag,
         identityAliases: identity.aliases,
-        status: isFirstTurn ? "PLAYING" : "WAITING_TURN",
+        status: "PLAYING",
         solvedAt: null,
         completionTimeSeconds: null,
       });
     });
 
-    if (isSupabaseConfigured && supabaseAdmin) {
+    if (isSupabaseAdminConfigured()) {
+      const admin = getSupabaseAdmin();
+      if (!admin) throw new Error("Database admin client unavailable");
+
       const insertRows = assignments.map((a) => ({
         id: a.id,
         room_id: a.roomId,
@@ -929,27 +1013,37 @@ export class GameService {
         identity_aliases: a.identityAliases,
         status: a.status,
       }));
-      await supabaseAdmin.from("round_assignments").insert(insertRows);
 
-      await supabaseAdmin.from("players").update({ is_ready: false }).eq("room_id", room.id);
-      await supabaseAdmin
+      const { error: assignErr } = await admin.from("round_assignments").insert(insertRows);
+      if (assignErr) {
+        logDbError("nextRound (table: round_assignments insert)", assignErr);
+        throw new Error(formatDbError(assignErr));
+      }
+
+      const { error: pErr } = await admin
+        .from("players")
+        .update({ is_ready: false })
+        .eq("room_id", room.id);
+      if (pErr) logDbError("nextRound (table: players update)", pErr);
+
+      const { error: roomErr } = await admin
         .from("rooms")
         .update({
           current_round: nextRoundNumber,
           status: "PLAYING",
           round_start_time: now,
-          current_turn_player_id: firstTurnPlayer.id,
-          turn_start_time: now,
           updated_at: now,
         })
         .eq("id", room.id);
+      if (roomErr) {
+        logDbError("nextRound (table: rooms update)", roomErr);
+        throw new Error(formatDbError(roomErr));
+      }
     } else {
       players.forEach((p) => (p.isReady = false));
       room.currentRound = nextRoundNumber;
       room.status = "PLAYING";
       room.roundStartTime = now;
-      room.currentTurnPlayerId = firstTurnPlayer.id;
-      room.turnStartTime = now;
       room.updatedAt = now;
       memoryDB.assignments.set(`${room.id}_${nextRoundNumber}`, assignments);
       memoryDB.usedIdentityIds.set(room.id, usedIds);

@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "npx tsx scripts/test-multiplayer.ts"
+    "test": "npx tsx --conditions react-server scripts/test-multiplayer.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.118.0",
@@ -15,7 +15,8 @@
     "lucide-react": "^1.65.0",
     "next": "16.4.3",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "server-only": "^0.0.1"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "^4",
